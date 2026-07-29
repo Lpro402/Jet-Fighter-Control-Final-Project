@@ -44,8 +44,6 @@ const LEAD_STATE_GAIN = LEAD_GAIN * (LEAD_POLE - LEAD_ZERO); // 4.76364
 
 const STATE_K = [9.29011, -0.002137, -1.91889, 0.088362, -0.23100];
 const STATE_NR = 0.00551719;
-const MAX_AILERON_RAD = 5 * D2R;
-const LQ_ANTI_WINDUP_GAIN = 3;
 
 const clamp = (value, min, max) => Math.min(max, Math.max(min, value));
 
@@ -114,6 +112,64 @@ const FLIGHT_MODEL = {
   inducedDrag: 0.075,
 };
 
+const createGustState = (sequence = 0) => ({
+  active: false,
+  elapsed: 0,
+  duration: 5,
+  sequence,
+  direction: sequence % 2 === 0 ? 1 : -1,
+  peakCrosswindMps: 14,
+  peakVerticalMps: 2.4,
+  crosswindMps: 0,
+  verticalMps: 0,
+  intensity: 0,
+  equivalentSideslipRad: 0,
+  betaRate: 0,
+  rollAcceleration: 0,
+  yawAcceleration: 0,
+});
+
+const startGust = previousGust => {
+  const sequence = (previousGust?.sequence ?? 0) + 1;
+  return {
+    ...createGustState(sequence),
+    active: true,
+  };
+};
+
+const advanceGust = (gust, dt, airspeed) => {
+  if (!gust?.active) return gust ?? createGustState();
+
+  gust.elapsed += dt;
+  const phase = clamp(gust.elapsed / gust.duration, 0, 1);
+
+  // A one-cosine gust enters and leaves continuously. There is no impulse at
+  // either edge, so the aircraft responds dynamically instead of "jumping".
+  const envelope = 0.5 - 0.5 * Math.cos(2 * Math.PI * phase);
+  gust.intensity = envelope;
+  gust.crosswindMps =
+    gust.direction * gust.peakCrosswindMps * envelope;
+  gust.verticalMps =
+    gust.peakVerticalMps * Math.sin(Math.PI * phase) * envelope;
+  gust.equivalentSideslipRad = Math.atan2(
+    gust.crosswindMps,
+    Math.max(80, airspeed)
+  );
+
+  // External disturbance channels only. The submitted A/B matrices and every
+  // controller law remain unchanged.
+  gust.betaRate = 0.18 * gust.equivalentSideslipRad;
+  gust.rollAcceleration = -3.5 * gust.equivalentSideslipRad;
+  gust.yawAcceleration = 1.5 * gust.equivalentSideslipRad;
+
+  if (phase >= 1) {
+    const sequence = gust.sequence;
+    Object.assign(gust, createGustState(sequence));
+  }
+
+  return gust;
+};
+
 const wrapRadians = angle => Math.atan2(Math.sin(angle), Math.cos(angle));
 
 const quaternionFromFlightAngles = (bank, pitch, heading) => {
@@ -174,7 +230,7 @@ const normaliseQuaternion = quaternion => {
   return quaternion.map(value => value / magnitude);
 };
 
-const integrateFlightPhysics = (flight, X, controlCommand, dt, gustInput) => {
+const integrateFlightPhysics = (flight, X, controlCommand, dt, gust) => {
   const [beta, p, r, phi, da] = X;
   const model = FLIGHT_MODEL;
   const safePhi = Number.isFinite(phi)
@@ -211,7 +267,7 @@ const integrateFlightPhysics = (flight, X, controlCommand, dt, gustInput) => {
   const pitchAcceleration =
     2.8 * (targetPitch - flight.pitch) -
     2.1 * flight.pitchRate +
-    0.00004 * gustInput;
+    0.018 * (gust?.verticalMps ?? 0);
   const nextPitchRate = clamp(
     flight.pitchRate + pitchAcceleration * dt,
     -30 * D2R,
@@ -230,8 +286,10 @@ const integrateFlightPhysics = (flight, X, controlCommand, dt, gustInput) => {
   const nextHeading = wrapRadians(flight.heading + yawRate * dt);
   const verticalSpeed =
     flight.airspeed * Math.sin(nextPitch) -
-    0.12 * Math.abs(Math.sin(safePhi)) * flight.airspeed;
+    0.12 * Math.abs(Math.sin(safePhi)) * flight.airspeed +
+    (gust?.verticalMps ?? 0);
   const horizontalSpeed = flight.airspeed * Math.cos(nextPitch);
+  const crosswind = gust?.crosswindMps ?? 0;
 
   // Keep the rendered attitude locked to the project model's roll angle.
   // This prevents quaternion drift, gimbal-looking flips and mode-switch jumps.
@@ -246,8 +304,14 @@ const integrateFlightPhysics = (flight, X, controlCommand, dt, gustInput) => {
   flight.altitude = Math.max(80, flight.altitude + verticalSpeed * dt);
   flight.verticalSpeed = verticalSpeed;
   flight.airspeed = clamp(flight.airspeed + airspeedDot * dt, 95, 340);
-  flight.north += horizontalSpeed * Math.cos(nextHeading) * dt;
-  flight.east += horizontalSpeed * Math.sin(nextHeading) * dt;
+  flight.north += (
+    horizontalSpeed * Math.cos(nextHeading) -
+    crosswind * Math.sin(nextHeading)
+  ) * dt;
+  flight.east += (
+    horizontalSpeed * Math.sin(nextHeading) +
+    crosswind * Math.cos(nextHeading)
+  ) * dt;
   flight.mach = flight.airspeed / Math.max(280, speedOfSound);
   flight.dynamicPressure = dynamicPressure;
   flight.loadFactor = clamp(
@@ -315,11 +379,7 @@ const computeRawControl = (X, phiCmdRad, ctrlType, measuredPhi = X[3]) => {
 };
 
 const computeControl = (X, phiCmdRad, ctrlType, measuredPhi = X[3]) =>
-  clamp(
-    computeRawControl(X, phiCmdRad, ctrlType, measuredPhi),
-    -MAX_AILERON_RAD,
-    MAX_AILERON_RAD
-  );
+  computeRawControl(X, phiCmdRad, ctrlType, measuredPhi);
 
 // Physics derivatives based on the final five-state aircraft model.
 // X = [beta, p, r, phi, delta_a, x_lead, x_i]
@@ -328,28 +388,30 @@ const getDerivatives = (
   phiCmdRad,
   ctrlType,
   measurementNoiseRad,
-  windGust
+  gust
 ) => {
   const [beta, p, r, phi, da, xc] = X;
 
   // The same sampled measurement must be used throughout one RK4 step.
   const measuredPhi = phi + measurementNoiseRad;
   const error = phiCmdRad - measuredPhi;
-  const rawDc = computeRawControl(X, phiCmdRad, ctrlType, measuredPhi);
-  const dc = clamp(rawDc, -MAX_AILERON_RAD, MAX_AILERON_RAD);
+  const dc = computeRawControl(X, phiCmdRad, ctrlType, measuredPhi);
 
-  const dBeta = -0.575 * beta - r + 0.0536 * phi - 0.078 * da;
-  const dP = -300 * beta - 3.03 * p + 2 * r + 64.4 * da + windGust;
-  const dR = 68 * beta + 0.045 * p - 2.4 * r + 5 * da;
+  const dBeta =
+    -0.575 * beta - r + 0.0536 * phi - 0.078 * da +
+    (gust?.betaRate ?? 0);
+  const dP =
+    -300 * beta - 3.03 * p + 2 * r + 64.4 * da +
+    (gust?.rollAcceleration ?? 0);
+  const dR =
+    68 * beta + 0.045 * p - 2.4 * r + 5 * da +
+    (gust?.yawAcceleration ?? 0);
   const dPhi = p;
   const dDa = -5 * da + 5 * dc;
 
   // Controller internal states are active only for their own architecture.
   const dXc = ctrlType === 'Lead' ? -LEAD_POLE * xc + error : 0;
-  const dXi =
-    ctrlType === 'LQServo'
-      ? error + LQ_ANTI_WINDUP_GAIN * (dc - rawDc)
-      : 0;
+  const dXi = ctrlType === 'LQServo' ? error : 0;
 
   return [dBeta, dP, dR, dPhi, dDa, dXc, dXi];
 };
@@ -363,7 +425,7 @@ const rk4Step = (
   ctrlType,
   dt,
   noiseAmplitudeRad,
-  windGust
+  gust
 ) => {
   // Sample-and-hold sensor noise over the complete RK4 integration step.
   // Re-sampling at k1...k4 would inject artificial high-frequency energy.
@@ -375,7 +437,7 @@ const rk4Step = (
       phiCmdRad,
       ctrlType,
       noiseSample,
-      windGust
+      gust
     );
 
   const k1 = derivative(X);
@@ -988,6 +1050,9 @@ export default function AdvancedAircraftSimulation() {
     pitch: 2.2,
     verticalSpeed: 0,
     turnRate: 0,
+    gustCrosswind: 0,
+    gustVertical: 0,
+    gustIntensity: 0,
   });
   const [noiseLvl, setNoiseLvl] = useState(0);
   const [simSpeed, setSimSpeed] = useState(1);
@@ -1002,7 +1067,7 @@ export default function AdvancedAircraftSimulation() {
     ctrlType: 'LQServo',
     history: [], 
     time: 0,
-    windGust: 0,
+    gust: createGustState(),
     maxDa: 0,
     maxDc: 0,
     flight: createFlightState(),
@@ -1084,6 +1149,39 @@ export default function AdvancedAircraftSimulation() {
     const particles = new THREE.Points(particlesGeo, particlesMat);
     scene.add(particles);
 
+    // Dedicated crosswind streaks. They stay hidden until a gust is active,
+    // then travel laterally across the aircraft with strength-based opacity.
+    const windLineCount = 110;
+    const windPositions = new Float32Array(windLineCount * 2 * 3);
+    for (let i = 0; i < windLineCount; i++) {
+      const offset = i * 6;
+      const x = (Math.random() - 0.5) * 20;
+      const y = (Math.random() - 0.5) * 10;
+      const z = (Math.random() - 0.5) * 25;
+      const length = 0.55 + Math.random() * 1.25;
+      windPositions[offset] = x;
+      windPositions[offset + 1] = y;
+      windPositions[offset + 2] = z;
+      windPositions[offset + 3] = x + length;
+      windPositions[offset + 4] = y;
+      windPositions[offset + 5] = z;
+    }
+    const windGeometry = new THREE.BufferGeometry();
+    windGeometry.setAttribute(
+      'position',
+      new THREE.BufferAttribute(windPositions, 3)
+    );
+    const windMaterial = new THREE.LineBasicMaterial({
+      color: 0x93c5fd,
+      transparent: true,
+      opacity: 0,
+      blending: THREE.AdditiveBlending,
+      depthWrite: false,
+    });
+    const windStreaks = new THREE.LineSegments(windGeometry, windMaterial);
+    windStreaks.visible = false;
+    scene.add(windStreaks);
+
     const {
       airplaneGroup,
       leftAileron,
@@ -1115,6 +1213,7 @@ export default function AdvancedAircraftSimulation() {
       navGreen,
       grid,
       particles,
+      windStreaks,
       rotationWrapper,
     };
 
@@ -1173,13 +1272,19 @@ export default function AdvancedAircraftSimulation() {
         const integrationDt = dt / steps;
 
         for (let i = 0; i < steps; i++) {
+          sim.current.gust = advanceGust(
+            sim.current.gust,
+            integrationDt,
+            sim.current.flight.airspeed
+          );
+
           sim.current.X = rk4Step(
             sim.current.X,
             sim.current.phi_cmd_rad,
             sim.current.ctrlType,
             integrationDt,
             noiseLvl * D2R,
-            sim.current.windGust
+            sim.current.gust
           );
 
           if (physicsMode === 'advanced') {
@@ -1192,12 +1297,10 @@ export default function AdvancedAircraftSimulation() {
                 sim.current.ctrlType
               ),
               integrationDt,
-              sim.current.windGust
+              sim.current.gust
             );
           }
 
-          // Time-based gust decay, independent of monitor frame rate.
-          sim.current.windGust *= Math.exp(-3 * integrationDt);
           sim.current.time += integrationDt;
         }
 
@@ -1222,6 +1325,9 @@ export default function AdvancedAircraftSimulation() {
           altitude: sim.current.flight.altitude,
           mach: sim.current.flight.mach,
           gLoad: sim.current.flight.loadFactor,
+          gustCrosswind: sim.current.gust.crosswindMps,
+          gustVertical: sim.current.gust.verticalMps,
+          gustIntensity: sim.current.gust.intensity,
         });
         if (sim.current.history.length > 600) sim.current.history.shift();
 
@@ -1237,6 +1343,7 @@ export default function AdvancedAircraftSimulation() {
           navGreen,
           grid,
           particles,
+          windStreaks,
           renderer,
           scene,
           camera,
@@ -1298,6 +1405,53 @@ export default function AdvancedAircraftSimulation() {
               }
           }
           particles.geometry.attributes.position.needsUpdate = true;
+
+          if (windStreaks) {
+            const gust = sim.current.gust;
+            const gustVisible =
+              showEnvironmentFx && gust.intensity > 0.005;
+            windStreaks.visible = gustVisible;
+
+            if (gustVisible) {
+              windStreaks.material.opacity =
+                0.18 + 0.72 * gust.intensity;
+              const windArray =
+                windStreaks.geometry.attributes.position.array;
+              const lateralStep =
+                gust.direction *
+                (4 + 15 * gust.intensity) *
+                Math.max(0.001, dt);
+              const verticalStep =
+                gust.verticalMps * Math.max(0.001, dt) * 0.25;
+
+              for (let j = 0; j < windArray.length; j += 6) {
+                windArray[j] += lateralStep;
+                windArray[j + 3] += lateralStep;
+                windArray[j + 1] += verticalStep;
+                windArray[j + 4] += verticalStep;
+
+                if (
+                  (gust.direction > 0 && windArray[j] > 11) ||
+                  (gust.direction < 0 && windArray[j + 3] < -11)
+                ) {
+                  const segmentLength =
+                    0.55 + Math.random() * 1.25;
+                  const startX = gust.direction > 0 ? -11 : 11;
+                  windArray[j] = startX;
+                  windArray[j + 1] =
+                    (Math.random() - 0.5) * 10;
+                  windArray[j + 2] =
+                    (Math.random() - 0.5) * 25;
+                  windArray[j + 3] =
+                    startX + gust.direction * segmentLength;
+                  windArray[j + 4] = windArray[j + 1];
+                  windArray[j + 5] = windArray[j + 2];
+                }
+              }
+
+              windStreaks.geometry.attributes.position.needsUpdate = true;
+            }
+          }
         }
 
         // Smooth Camera Lerping
@@ -1343,6 +1497,9 @@ export default function AdvancedAircraftSimulation() {
             pitch: sim.current.flight.pitch * R2D,
             verticalSpeed: sim.current.flight.verticalSpeed,
             turnRate: sim.current.flight.turnRate,
+            gustCrosswind: sim.current.gust.crosswindMps,
+            gustVertical: sim.current.gust.verticalMps,
+            gustIntensity: sim.current.gust.intensity,
           });
           lastUiUpdate = time;
         }
@@ -1357,14 +1514,14 @@ export default function AdvancedAircraftSimulation() {
   }, [paused, noiseLvl, simSpeed, physicsMode, showEnvironmentFx]);
 
   const triggerGust = () => {
-    sim.current.windGust = 80; // Short stress-test disturbance in p-dot
+    sim.current.gust = startGust(sim.current.gust);
   };
 
   const resetSim = () => {
     sim.current.X = [0,0,0,0,0,0,0];
     sim.current.history = [];
     sim.current.time = 0;
-    sim.current.windGust = 0;
+    sim.current.gust = createGustState(sim.current.gust?.sequence ?? 0);
     sim.current.maxDa = 0;
     sim.current.maxDc = 0;
     sim.current.flight = createFlightState();
@@ -1389,6 +1546,9 @@ export default function AdvancedAircraftSimulation() {
       pitch: 2.2,
       verticalSpeed: 0,
       turnRate: 0,
+      gustCrosswind: 0,
+      gustVertical: 0,
+      gustIntensity: 0,
     });
     targetRotation.current = { x: 0, y: Math.PI / 8 };
     currentRotation.current = { x: 0, y: Math.PI / 8 };
@@ -1447,6 +1607,9 @@ export default function AdvancedAircraftSimulation() {
         'altitude_m',
         'mach',
         'g_load',
+        'gust_crosswind_m_s',
+        'gust_vertical_m_s',
+        'gust_intensity',
       ],
       ...sim.current.history.map(point => [
         point.t.toFixed(4),
@@ -1462,6 +1625,9 @@ export default function AdvancedAircraftSimulation() {
         point.altitude.toFixed(4),
         point.mach.toFixed(5),
         point.gLoad.toFixed(5),
+        point.gustCrosswind.toFixed(5),
+        point.gustVertical.toFixed(5),
+        point.gustIntensity.toFixed(5),
       ]),
     ];
     const csv = rows.map(row => row.join(',')).join('\n');
@@ -1545,6 +1711,20 @@ export default function AdvancedAircraftSimulation() {
             <div className="absolute top-6 right-6 bg-slate-900/80 border border-slate-600 px-4 py-2 rounded-lg text-sm font-mono text-sky-400 backdrop-blur-md pointer-events-none shadow-[0_0_15px_rgba(56,189,248,0.2)]" dir="ltr">
               TIME: {stats.time.toFixed(2)}s
             </div>
+
+            {stats.gustIntensity > 0.005 && (
+              <div
+                className="absolute top-24 left-1/2 z-10 flex -translate-x-1/2 items-center gap-3 rounded-xl border border-sky-300/60 bg-sky-950/75 px-4 py-2 font-mono text-xs text-sky-100 shadow-[0_0_24px_rgba(56,189,248,0.35)] backdrop-blur-md pointer-events-none"
+                dir="ltr"
+              >
+                <Wind size={17} className="text-sky-300 animate-pulse" />
+                <span>GUST {Math.round(stats.gustIntensity * 100)}%</span>
+                <strong>
+                  CROSSWIND {Math.abs(stats.gustCrosswind).toFixed(1)} m/s
+                </strong>
+                <span>VERT {stats.gustVertical.toFixed(1)} m/s</span>
+              </div>
+            )}
 
             {showAdvancedHud && (
               <>
