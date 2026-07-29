@@ -1,0 +1,8 @@
+Controller,RiseTime_s,SettlingTime_s,Overshoot_pct,SteadyStateError_pct,PeakAileron_deg,MeasuredSignals
+P,0.872175,4.2624,15.496478,9.783508,1.217348,"phi"
+Rate + angle,1.180139,5.86581,15.985,17.218,0.773366,"phi,p"
+Phase lead,0.502717,1.786242,9.171484,6.147313,2.94781,"phi"
+Full state,1.260218,3.667378,6.405,0,0.934973,"all states"
+Observer (phi),1.260218,3.667378,6.405,0,0.934973,"phi"
+Observer (p),1.260218,3.667378,6.405,0,0.934973,"p"
+LQ servo,1.389101,2.607006,0,0,4.264068,"all states / estimator"

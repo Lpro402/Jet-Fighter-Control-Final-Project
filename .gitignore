@@ -1,0 +1,24 @@
+# Operating system and editors
+.DS_Store
+Thumbs.db
+*.asv
+*.autosave
+
+# MATLAB temporary files
+*.m~
+slprj/
+codegen/
+
+# Node / simulator
+simulator/node_modules/
+simulator/dist/
+simulator/.wrangler/
+simulator/*.tgz
+simulator/.env
+simulator/.env.*
+!simulator/.env.example
+
+# Logs and local caches
+*.log
+.cache/
+tmp/
