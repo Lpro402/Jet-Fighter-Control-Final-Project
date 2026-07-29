@@ -115,11 +115,11 @@ const FLIGHT_MODEL = {
 const createGustState = (sequence = 0) => ({
   active: false,
   elapsed: 0,
-  duration: 5,
+  duration: 3.2,
   sequence,
   direction: sequence % 2 === 0 ? 1 : -1,
-  peakCrosswindMps: 14,
-  peakVerticalMps: 2.4,
+  peakCrosswindMps: 18,
+  peakVerticalMps: 3.2,
   crosswindMps: 0,
   verticalMps: 0,
   intensity: 0,
@@ -130,6 +130,11 @@ const createGustState = (sequence = 0) => ({
 });
 
 const startGust = previousGust => {
+  // Do not restart or reverse an active gust. Re-triggering the previous
+  // implementation caused an abrupt force discontinuity that looked like a
+  // state jump.
+  if (previousGust?.active) return previousGust;
+
   const sequence = (previousGust?.sequence ?? 0) + 1;
   return {
     ...createGustState(sequence),
@@ -143,24 +148,38 @@ const advanceGust = (gust, dt, airspeed) => {
   gust.elapsed += dt;
   const phase = clamp(gust.elapsed / gust.duration, 0, 1);
 
-  // A one-cosine gust enters and leaves continuously. There is no impulse at
-  // either edge, so the aircraft responds dynamically instead of "jumping".
-  const envelope = 0.5 - 0.5 * Math.cos(2 * Math.PI * phase);
+  // Fast continuous rise followed by an aerodynamic decay. The force starts
+  // at zero (no state jump), but reaches its peak quickly enough to create a
+  // visible roll upset that the selected controller must reject.
+  const riseTime = 0.12;
+  const decayTime = 0.65;
+  const peakTime = riseTime * Math.log1p(decayTime / riseTime);
+  const pulseAt = time =>
+    (1 - Math.exp(-time / riseTime)) * Math.exp(-time / decayTime);
+  const envelope = clamp(
+    pulseAt(gust.elapsed) / pulseAt(peakTime),
+    0,
+    1
+  );
   gust.intensity = envelope;
   gust.crosswindMps =
     gust.direction * gust.peakCrosswindMps * envelope;
   gust.verticalMps =
-    gust.peakVerticalMps * Math.sin(Math.PI * phase) * envelope;
+    gust.peakVerticalMps *
+    Math.sin((2 * Math.PI * gust.elapsed) / 1.3) *
+    envelope;
   gust.equivalentSideslipRad = Math.atan2(
     gust.crosswindMps,
     Math.max(80, airspeed)
   );
 
-  // External disturbance channels only. The submitted A/B matrices and every
-  // controller law remain unchanged.
-  gust.betaRate = 0.18 * gust.equivalentSideslipRad;
-  gust.rollAcceleration = -3.5 * gust.equivalentSideslipRad;
-  gust.yawAcceleration = 1.5 * gust.equivalentSideslipRad;
+  // The course model receives the gust as an external rolling moment in p-dot,
+  // exactly like the original stress test. Injecting it into beta and r made
+  // Full-State feedback produce a non-physical transient. A/B and every
+  // submitted controller law remain unchanged.
+  gust.betaRate = 0;
+  gust.rollAcceleration = gust.direction * 2.5 * envelope;
+  gust.yawAcceleration = 0;
 
   if (phase >= 1) {
     const sequence = gust.sequence;
@@ -1195,7 +1214,9 @@ export default function AdvancedAircraftSimulation() {
     } = buildAdvancedAirplane();
     
     const rotationWrapper = new THREE.Group();
-    rotationWrapper.add(airplaneGroup);
+    const airframeMotion = new THREE.Group();
+    airframeMotion.add(airplaneGroup);
+    rotationWrapper.add(airframeMotion);
     scene.add(rotationWrapper);
 
     sceneRefs.current = {
@@ -1214,6 +1235,7 @@ export default function AdvancedAircraftSimulation() {
       grid,
       particles,
       windStreaks,
+      airframeMotion,
       rotationWrapper,
     };
 
@@ -1344,6 +1366,7 @@ export default function AdvancedAircraftSimulation() {
           grid,
           particles,
           windStreaks,
+          airframeMotion,
           renderer,
           scene,
           camera,
@@ -1362,9 +1385,32 @@ export default function AdvancedAircraftSimulation() {
               -sim.current.X[3]
             );
           }
+
+          // Small presentation-only airframe buffet makes the gust front
+          // perceptible while the authoritative bank angle still comes from
+          // the project model above.
+          if (airframeMotion) {
+            const gust = sim.current.gust;
+            const buffet = gust.intensity;
+            airframeMotion.position.x =
+              gust.direction * 0.08 * buffet +
+              Math.sin(sim.current.time * 31) * 0.018 * buffet;
+            airframeMotion.position.y =
+              Math.sin(sim.current.time * 43) * 0.014 * buffet;
+            airframeMotion.rotation.z =
+              gust.direction * 0.012 * buffet +
+              Math.sin(sim.current.time * 37) * 0.004 * buffet;
+          }
           
-          leftAileron.rotation.x = sim.current.X[4];
-          rightAileron.rotation.x = -sim.current.X[4];
+          // Actual aileron values remain unchanged in the model and telemetry.
+          // The 3D mesh is amplified only so small control actions are visible.
+          const visualAileronAngle = clamp(
+            sim.current.X[4] * 4,
+            -20 * D2R,
+            20 * D2R
+          );
+          leftAileron.rotation.x = visualAileronAngle;
+          rightAileron.rotation.x = -visualAileronAngle;
           if (leftStabilator && rightStabilator) {
             const stabilatorAngle =
               physicsMode === 'advanced'
@@ -1642,12 +1688,19 @@ export default function AdvancedAircraftSimulation() {
   useEffect(() => {
     const onKeyDown = event => {
       if (event.target instanceof HTMLInputElement) return;
+      if (event.repeat) return;
       if (event.code === 'Space') {
         event.preventDefault();
         setPaused(value => !value);
       }
-      if (event.key.toLowerCase() === 'r') resetSim();
-      if (event.key.toLowerCase() === 'g') triggerGust();
+      if (event.code === 'KeyR') {
+        event.preventDefault();
+        resetSim();
+      }
+      if (event.code === 'KeyG') {
+        event.preventDefault();
+        triggerGust();
+      }
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
