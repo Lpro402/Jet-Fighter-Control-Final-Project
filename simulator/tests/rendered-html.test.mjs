@@ -31,7 +31,8 @@ test("server-renders the aircraft control simulator", async () => {
   const html = await response.text();
   assert.match(html, /<title>Advanced Autopilot Testbed<\/title>/i);
   assert.match(html, /Advanced Autopilot/);
-  assert.match(html, /הזרקת מכת רוח/);
+  assert.match(html, /מכת רוח רגילה/);
+  assert.match(html, /טורבולנציה חזקה/);
   assert.match(html, /דיאגרמת חוג הבקרה הפעיל/);
   assert.match(html, /LQ Servo \(Optimal\)/);
   assert.doesNotMatch(html, /codex-preview|Building your site|SkeletonPreview/i);
@@ -53,17 +54,23 @@ test("preserves the submitted controllers and isolates the gust", async () => {
 
   assert.match(page, /if \(previousGust\?\.active\) return previousGust;/);
   assert.match(page, /gust\.betaRate = 0;/);
-  assert.match(
-    page,
-    /gust\.rollAcceleration = gust\.direction \* 2\.5 \* envelope;/,
-  );
+  assert.match(page, /gust\.type === 'turbulence'/);
+  assert.match(page, /rollAcceleration: 4\.25/);
+  assert.match(page, /profile\.rollAcceleration/);
   assert.match(page, /gust\.yawAcceleration = 0;/);
 
   assert.match(page, /event\.code === 'KeyR'/);
   assert.match(page, /event\.code === 'KeyG'/);
+  assert.match(page, /event\.code === 'KeyD'/);
+  assert.match(page, /triggerTurbulence/);
   assert.match(page, /if \(event\.repeat\) return;/);
   assert.doesNotMatch(page, /event\.key\.toLowerCase\(\)/);
 
   assert.match(page, /const airframeMotion = new THREE\.Group\(\);/);
   assert.match(page, /sim\.current\.X\[4\] \* 4/);
+  assert.match(page, /const createWingTrail = colorHex =>/);
+  assert.match(page, /leftWingTrail\.group/);
+  assert.match(page, /rightWingTrail\.group/);
+  assert.match(page, /appendWingTrail/);
+  assert.match(page, /clearWingTrail/);
 });

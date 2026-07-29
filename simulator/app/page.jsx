@@ -112,24 +112,45 @@ const FLIGHT_MODEL = {
   inducedDrag: 0.075,
 };
 
-const createGustState = (sequence = 0) => ({
-  active: false,
-  elapsed: 0,
-  duration: 3.2,
-  sequence,
-  direction: sequence % 2 === 0 ? 1 : -1,
-  peakCrosswindMps: 18,
-  peakVerticalMps: 3.2,
-  crosswindMps: 0,
-  verticalMps: 0,
-  intensity: 0,
-  equivalentSideslipRad: 0,
-  betaRate: 0,
-  rollAcceleration: 0,
-  yawAcceleration: 0,
-});
+const DISTURBANCE_PROFILES = {
+  gust: {
+    duration: 3.2,
+    peakCrosswindMps: 18,
+    peakVerticalMps: 3.2,
+    rollAcceleration: 2.5,
+  },
+  turbulence: {
+    duration: 4,
+    peakCrosswindMps: 30,
+    peakVerticalMps: 5.5,
+    rollAcceleration: 4.25,
+  },
+};
 
-const startGust = previousGust => {
+const createGustState = (sequence = 0, type = 'gust') => {
+  const profile =
+    DISTURBANCE_PROFILES[type] ?? DISTURBANCE_PROFILES.gust;
+
+  return {
+    active: false,
+    elapsed: 0,
+    duration: profile.duration,
+    sequence,
+    type,
+    direction: sequence % 2 === 0 ? 1 : -1,
+    peakCrosswindMps: profile.peakCrosswindMps,
+    peakVerticalMps: profile.peakVerticalMps,
+    crosswindMps: 0,
+    verticalMps: 0,
+    intensity: 0,
+    equivalentSideslipRad: 0,
+    betaRate: 0,
+    rollAcceleration: 0,
+    yawAcceleration: 0,
+  };
+};
+
+const startGust = (previousGust, type = 'gust') => {
   // Do not restart or reverse an active gust. Re-triggering the previous
   // implementation caused an abrupt force discontinuity that looked like a
   // state jump.
@@ -137,7 +158,7 @@ const startGust = previousGust => {
 
   const sequence = (previousGust?.sequence ?? 0) + 1;
   return {
-    ...createGustState(sequence),
+    ...createGustState(sequence, type),
     active: true,
   };
 };
@@ -151,8 +172,9 @@ const advanceGust = (gust, dt, airspeed) => {
   // Fast continuous rise followed by an aerodynamic decay. The force starts
   // at zero (no state jump), but reaches its peak quickly enough to create a
   // visible roll upset that the selected controller must reject.
-  const riseTime = 0.12;
-  const decayTime = 0.65;
+  const severe = gust.type === 'turbulence';
+  const riseTime = severe ? 0.09 : 0.12;
+  const decayTime = severe ? 0.85 : 0.65;
   const peakTime = riseTime * Math.log1p(decayTime / riseTime);
   const pulseAt = time =>
     (1 - Math.exp(-time / riseTime)) * Math.exp(-time / decayTime);
@@ -161,13 +183,23 @@ const advanceGust = (gust, dt, airspeed) => {
     0,
     1
   );
-  gust.intensity = envelope;
+  const exitPhase = severe
+    ? clamp((gust.duration - gust.elapsed) / 0.45, 0, 1)
+    : 1;
+  const exitWindow = severe
+    ? exitPhase * exitPhase * (3 - 2 * exitPhase)
+    : 1;
+  const effectiveEnvelope = envelope * exitWindow;
+
+  gust.intensity = effectiveEnvelope;
   gust.crosswindMps =
-    gust.direction * gust.peakCrosswindMps * envelope;
+    gust.direction * gust.peakCrosswindMps * effectiveEnvelope;
   gust.verticalMps =
     gust.peakVerticalMps *
-    Math.sin((2 * Math.PI * gust.elapsed) / 1.3) *
-    envelope;
+    Math.sin(
+      (2 * Math.PI * gust.elapsed) / (severe ? 0.78 : 1.3)
+    ) *
+    effectiveEnvelope;
   gust.equivalentSideslipRad = Math.atan2(
     gust.crosswindMps,
     Math.max(80, airspeed)
@@ -178,7 +210,22 @@ const advanceGust = (gust, dt, airspeed) => {
   // Full-State feedback produce a non-physical transient. A/B and every
   // submitted controller law remain unchanged.
   gust.betaRate = 0;
-  gust.rollAcceleration = gust.direction * 2.5 * envelope;
+  const turbulenceMultiplier = severe
+    ? clamp(
+        1 +
+          0.18 * Math.sin(2 * Math.PI * 5.2 * gust.elapsed) +
+          0.1 * Math.sin(2 * Math.PI * 9.1 * gust.elapsed + 0.7),
+        0.65,
+        1.3
+      )
+    : 1;
+  const profile =
+    DISTURBANCE_PROFILES[gust.type] ?? DISTURBANCE_PROFILES.gust;
+  gust.rollAcceleration =
+    gust.direction *
+    profile.rollAcceleration *
+    effectiveEnvelope *
+    turbulenceMultiplier;
   gust.yawAcceleration = 0;
 
   if (phase >= 1) {
@@ -187,6 +234,125 @@ const advanceGust = (gust, dt, airspeed) => {
   }
 
   return gust;
+};
+
+const WING_TRAIL_CAPACITY = 96;
+const WING_TRAIL_SAMPLE_DT = 1 / 45;
+
+const createWingTrail = colorHex => {
+  const positions = new Float32Array(WING_TRAIL_CAPACITY * 3);
+  const colors = new Float32Array(WING_TRAIL_CAPACITY * 3);
+  const positionAttribute = new THREE.BufferAttribute(positions, 3);
+  const colorAttribute = new THREE.BufferAttribute(colors, 3);
+
+  positionAttribute.setUsage(THREE.DynamicDrawUsage);
+  colorAttribute.setUsage(THREE.DynamicDrawUsage);
+
+  const geometry = new THREE.BufferGeometry();
+  geometry.setAttribute('position', positionAttribute);
+  geometry.setAttribute('color', colorAttribute);
+  geometry.setDrawRange(0, 0);
+
+  const line = new THREE.Line(
+    geometry,
+    new THREE.LineBasicMaterial({
+      vertexColors: true,
+      transparent: true,
+      opacity: 0.92,
+      blending: THREE.AdditiveBlending,
+      depthWrite: false,
+      depthTest: false,
+      toneMapped: false,
+    })
+  );
+  const glowPoints = new THREE.Points(
+    geometry,
+    new THREE.PointsMaterial({
+      size: 0.075,
+      sizeAttenuation: true,
+      vertexColors: true,
+      transparent: true,
+      opacity: 0.48,
+      blending: THREE.AdditiveBlending,
+      depthWrite: false,
+      depthTest: false,
+      toneMapped: false,
+    })
+  );
+
+  line.frustumCulled = false;
+  glowPoints.frustumCulled = false;
+  line.renderOrder = 8;
+  glowPoints.renderOrder = 9;
+
+  const group = new THREE.Group();
+  group.add(line, glowPoints);
+  group.visible = false;
+
+  return {
+    group,
+    geometry,
+    positions,
+    colors,
+    baseColor: new THREE.Color(colorHex),
+    samples: Array.from(
+      { length: WING_TRAIL_CAPACITY },
+      () => new THREE.Vector3()
+    ),
+    head: 0,
+    count: 0,
+    lastSampleTime: -Infinity,
+  };
+};
+
+const appendWingTrail = (trail, point, simulationTime) => {
+  if (
+    simulationTime - trail.lastSampleTime <
+    WING_TRAIL_SAMPLE_DT
+  ) {
+    return;
+  }
+
+  trail.lastSampleTime = simulationTime;
+  trail.samples[trail.head].copy(point);
+  trail.head = (trail.head + 1) % WING_TRAIL_CAPACITY;
+  trail.count = Math.min(trail.count + 1, WING_TRAIL_CAPACITY);
+
+  const oldest =
+    (trail.head - trail.count + WING_TRAIL_CAPACITY) %
+    WING_TRAIL_CAPACITY;
+
+  for (let index = 0; index < trail.count; index++) {
+    const sample =
+      trail.samples[(oldest + index) % WING_TRAIL_CAPACITY];
+    const offset = index * 3;
+    const fade = Math.pow(
+      (index + 1) / Math.max(2, trail.count),
+      1.7
+    );
+
+    trail.positions[offset] = sample.x;
+    trail.positions[offset + 1] = sample.y;
+    trail.positions[offset + 2] = sample.z;
+    trail.colors[offset] = trail.baseColor.r * fade;
+    trail.colors[offset + 1] = trail.baseColor.g * fade;
+    trail.colors[offset + 2] = trail.baseColor.b * fade;
+  }
+
+  trail.geometry.setDrawRange(0, trail.count);
+  trail.geometry.attributes.position.needsUpdate = true;
+  trail.geometry.attributes.color.needsUpdate = true;
+  trail.group.visible = trail.count > 1;
+};
+
+const clearWingTrail = trail => {
+  if (!trail) return;
+
+  trail.head = 0;
+  trail.count = 0;
+  trail.lastSampleTime = -Infinity;
+  trail.geometry.setDrawRange(0, 0);
+  trail.group.visible = false;
 };
 
 const wrapRadians = angle => Math.atan2(Math.sin(angle), Math.cos(angle));
@@ -1072,6 +1238,7 @@ export default function AdvancedAircraftSimulation() {
     gustCrosswind: 0,
     gustVertical: 0,
     gustIntensity: 0,
+    gustType: 'gust',
   });
   const [noiseLvl, setNoiseLvl] = useState(0);
   const [simSpeed, setSimSpeed] = useState(1);
@@ -1216,7 +1383,13 @@ export default function AdvancedAircraftSimulation() {
     const rotationWrapper = new THREE.Group();
     const airframeMotion = new THREE.Group();
     airframeMotion.add(airplaneGroup);
-    rotationWrapper.add(airframeMotion);
+    const leftWingTrail = createWingTrail(0xff334f);
+    const rightWingTrail = createWingTrail(0x22c55e);
+    rotationWrapper.add(
+      airframeMotion,
+      leftWingTrail.group,
+      rightWingTrail.group
+    );
     scene.add(rotationWrapper);
 
     sceneRefs.current = {
@@ -1236,6 +1409,10 @@ export default function AdvancedAircraftSimulation() {
       particles,
       windStreaks,
       airframeMotion,
+      leftWingTrail,
+      rightWingTrail,
+      leftWingTipPosition: new THREE.Vector3(),
+      rightWingTipPosition: new THREE.Vector3(),
       rotationWrapper,
     };
 
@@ -1350,6 +1527,7 @@ export default function AdvancedAircraftSimulation() {
           gustCrosswind: sim.current.gust.crosswindMps,
           gustVertical: sim.current.gust.verticalMps,
           gustIntensity: sim.current.gust.intensity,
+          gustType: sim.current.gust.type,
         });
         if (sim.current.history.length > 600) sim.current.history.shift();
 
@@ -1367,6 +1545,10 @@ export default function AdvancedAircraftSimulation() {
           particles,
           windStreaks,
           airframeMotion,
+          leftWingTrail,
+          rightWingTrail,
+          leftWingTipPosition,
+          rightWingTipPosition,
           renderer,
           scene,
           camera,
@@ -1391,7 +1573,9 @@ export default function AdvancedAircraftSimulation() {
           // the project model above.
           if (airframeMotion) {
             const gust = sim.current.gust;
-            const buffet = gust.intensity;
+            const buffet =
+              gust.intensity *
+              (gust.type === 'turbulence' ? 1.65 : 1);
             airframeMotion.position.x =
               gust.direction * 0.08 * buffet +
               Math.sin(sim.current.time * 31) * 0.018 * buffet;
@@ -1435,6 +1619,39 @@ export default function AdvancedAircraftSimulation() {
             navGreen.intensity = showEnvironmentFx ? strobe : 0;
           }
 
+          if (
+            leftWingTrail &&
+            rightWingTrail &&
+            leftWingTipPosition &&
+            rightWingTipPosition &&
+            navRed &&
+            navGreen &&
+            rotationWrapper
+          ) {
+            if (showEnvironmentFx) {
+              rotationWrapper.updateWorldMatrix(true, true);
+
+              navRed.getWorldPosition(leftWingTipPosition);
+              rotationWrapper.worldToLocal(leftWingTipPosition);
+              navGreen.getWorldPosition(rightWingTipPosition);
+              rotationWrapper.worldToLocal(rightWingTipPosition);
+
+              appendWingTrail(
+                leftWingTrail,
+                leftWingTipPosition,
+                sim.current.time
+              );
+              appendWingTrail(
+                rightWingTrail,
+                rightWingTipPosition,
+                sim.current.time
+              );
+            } else {
+              clearWingTrail(leftWingTrail);
+              clearWingTrail(rightWingTrail);
+            }
+          }
+
           // Move Grid
           grid.position.z = (sim.current.time * 15) % 2;
           grid.visible = showEnvironmentFx;
@@ -1454,18 +1671,24 @@ export default function AdvancedAircraftSimulation() {
 
           if (windStreaks) {
             const gust = sim.current.gust;
+            const severe = gust.type === 'turbulence';
             const gustVisible =
               showEnvironmentFx && gust.intensity > 0.005;
             windStreaks.visible = gustVisible;
 
             if (gustVisible) {
+              windStreaks.material.color.setHex(
+                severe ? 0xc084fc : 0x93c5fd
+              );
               windStreaks.material.opacity =
-                0.18 + 0.72 * gust.intensity;
+                0.18 +
+                (severe ? 0.82 : 0.72) * gust.intensity;
               const windArray =
                 windStreaks.geometry.attributes.position.array;
               const lateralStep =
                 gust.direction *
                 (4 + 15 * gust.intensity) *
+                (severe ? 1.45 : 1) *
                 Math.max(0.001, dt);
               const verticalStep =
                 gust.verticalMps * Math.max(0.001, dt) * 0.25;
@@ -1546,6 +1769,7 @@ export default function AdvancedAircraftSimulation() {
             gustCrosswind: sim.current.gust.crosswindMps,
             gustVertical: sim.current.gust.verticalMps,
             gustIntensity: sim.current.gust.intensity,
+            gustType: sim.current.gust.type,
           });
           lastUiUpdate = time;
         }
@@ -1560,7 +1784,14 @@ export default function AdvancedAircraftSimulation() {
   }, [paused, noiseLvl, simSpeed, physicsMode, showEnvironmentFx]);
 
   const triggerGust = () => {
-    sim.current.gust = startGust(sim.current.gust);
+    sim.current.gust = startGust(sim.current.gust, 'gust');
+  };
+
+  const triggerTurbulence = () => {
+    sim.current.gust = startGust(
+      sim.current.gust,
+      'turbulence'
+    );
   };
 
   const resetSim = () => {
@@ -1571,6 +1802,8 @@ export default function AdvancedAircraftSimulation() {
     sim.current.maxDa = 0;
     sim.current.maxDc = 0;
     sim.current.flight = createFlightState();
+    clearWingTrail(sceneRefs.current.leftWingTrail);
+    clearWingTrail(sceneRefs.current.rightWingTrail);
     setStats({
       phi: 0,
       p: 0,
@@ -1595,6 +1828,7 @@ export default function AdvancedAircraftSimulation() {
       gustCrosswind: 0,
       gustVertical: 0,
       gustIntensity: 0,
+      gustType: 'gust',
     });
     targetRotation.current = { x: 0, y: Math.PI / 8 };
     currentRotation.current = { x: 0, y: Math.PI / 8 };
@@ -1628,6 +1862,8 @@ export default function AdvancedAircraftSimulation() {
 
   const handlePhysicsModeChange = mode => {
     setPhysicsMode(mode);
+    clearWingTrail(sceneRefs.current.leftWingTrail);
+    clearWingTrail(sceneRefs.current.rightWingTrail);
     sim.current.flight = createFlightState(
       sim.current.X[3],
       sim.current.flight?.heading ?? 0
@@ -1653,6 +1889,7 @@ export default function AdvancedAircraftSimulation() {
         'altitude_m',
         'mach',
         'g_load',
+        'disturbance_type',
         'gust_crosswind_m_s',
         'gust_vertical_m_s',
         'gust_intensity',
@@ -1671,6 +1908,7 @@ export default function AdvancedAircraftSimulation() {
         point.altitude.toFixed(4),
         point.mach.toFixed(5),
         point.gLoad.toFixed(5),
+        point.gustType,
         point.gustCrosswind.toFixed(5),
         point.gustVertical.toFixed(5),
         point.gustIntensity.toFixed(5),
@@ -1700,6 +1938,10 @@ export default function AdvancedAircraftSimulation() {
       if (event.code === 'KeyG') {
         event.preventDefault();
         triggerGust();
+      }
+      if (event.code === 'KeyD') {
+        event.preventDefault();
+        triggerTurbulence();
       }
     };
     window.addEventListener('keydown', onKeyDown);
@@ -1771,7 +2013,12 @@ export default function AdvancedAircraftSimulation() {
                 dir="ltr"
               >
                 <Wind size={17} className="text-sky-300 animate-pulse" />
-                <span>GUST {Math.round(stats.gustIntensity * 100)}%</span>
+                <span>
+                  {stats.gustType === 'turbulence'
+                    ? 'TURBULENCE D'
+                    : 'GUST G'}{' '}
+                  {Math.round(stats.gustIntensity * 100)}%
+                </span>
                 <strong>
                   CROSSWIND {Math.abs(stats.gustCrosswind).toFixed(1)} m/s
                 </strong>
@@ -1881,7 +2128,14 @@ export default function AdvancedAircraftSimulation() {
                   <input
                     type="checkbox"
                     checked={showEnvironmentFx}
-                    onChange={event => setShowEnvironmentFx(event.target.checked)}
+                    onChange={event => {
+                      const enabled = event.target.checked;
+                      setShowEnvironmentFx(enabled);
+                      if (!enabled) {
+                        clearWingTrail(sceneRefs.current.leftWingTrail);
+                        clearWingTrail(sceneRefs.current.rightWingTrail);
+                      }
+                    }}
                   />
                   <span>אפקטי סביבה</span>
                 </label>
@@ -1937,9 +2191,19 @@ export default function AdvancedAircraftSimulation() {
               <button 
                 onClick={triggerGust}
                 className="w-full flex items-center justify-center gap-2 bg-indigo-600/20 hover:bg-indigo-600/40 border border-indigo-500/50 text-indigo-300 font-bold py-2.5 rounded-xl transition-all shadow-[0_0_15px_rgba(79,70,229,0.2)] active:scale-95"
+                title="מכת רוח רגילה · מקש G"
               >
                 <Wind size={18} />
-                הזרקת מכת רוח (Gust)
+                מכת רוח רגילה (G)
+              </button>
+
+              <button
+                onClick={triggerTurbulence}
+                className="w-full flex items-center justify-center gap-2 bg-fuchsia-600/20 hover:bg-fuchsia-600/40 border border-fuchsia-400/60 text-fuchsia-200 font-bold py-2.5 rounded-xl transition-all shadow-[0_0_18px_rgba(192,132,252,0.22)] active:scale-95"
+                title="טורבולנציה חזקה · מקש D"
+              >
+                <Activity size={18} />
+                טורבולנציה חזקה (D)
               </button>
               
               <div className="bg-slate-950 p-3 rounded-xl border border-slate-700 shadow-inner">
@@ -2003,7 +2267,9 @@ export default function AdvancedAircraftSimulation() {
           <div className="flex items-center justify-between rounded-xl border border-slate-700/60 bg-slate-900/40 px-4 py-2 text-[11px] font-mono text-slate-400" dir="ltr">
             <span className="flex items-center gap-1"><Activity size={13} /> MAX |δa|: <strong className={stats.maxDa > 5 ? 'text-rose-400' : 'text-emerald-400'}>{stats.maxDa.toFixed(2)}°</strong></span>
             <span>MAX |δc|: <strong className="text-amber-300">{stats.maxDc.toFixed(2)}°</strong></span>
-            <span className="hidden 2xl:inline">SPACE pause · R reset · G gust</span>
+            <span className="hidden 2xl:inline">
+              SPACE pause · R reset · G gust · D severe turbulence
+            </span>
           </div>
 
           {/* Oscilloscopes */}
