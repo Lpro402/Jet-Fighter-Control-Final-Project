@@ -44,6 +44,8 @@ const LEAD_STATE_GAIN = LEAD_GAIN * (LEAD_POLE - LEAD_ZERO); // 4.76364
 
 const STATE_K = [9.29011, -0.002137, -1.91889, 0.088362, -0.23100];
 const STATE_NR = 0.00551719;
+const MAX_AILERON_RAD = 5 * D2R;
+const LQ_ANTI_WINDUP_GAIN = 3;
 
 const clamp = (value, min, max) => Math.min(max, Math.max(min, value));
 
@@ -112,11 +114,47 @@ const FLIGHT_MODEL = {
   inducedDrag: 0.075,
 };
 
-const createFlightState = () => ({
-  quaternion: [0, 0, 0, 1],
-  pitch: 2.2 * D2R,
+const wrapRadians = angle => Math.atan2(Math.sin(angle), Math.cos(angle));
+
+const quaternionFromFlightAngles = (bank, pitch, heading) => {
+  // Aircraft axes in the scene: pitch=X, yaw=Y, roll=Z, forward=+Z.
+  // Compose yaw * pitch * roll from the authoritative Euler angles instead
+  // of integrating a second, drifting attitude state.
+  const halfPitch = pitch / 2;
+  const halfHeading = heading / 2;
+  const halfRoll = -bank / 2;
+  const sp = Math.sin(halfPitch);
+  const cp = Math.cos(halfPitch);
+  const sh = Math.sin(halfHeading);
+  const ch = Math.cos(halfHeading);
+  const sr = Math.sin(halfRoll);
+  const cr = Math.cos(halfRoll);
+
+  const yawPitch = {
+    x: ch * sp,
+    y: sh * cp,
+    z: -sh * sp,
+    w: ch * cp,
+  };
+
+  return normaliseQuaternion([
+    yawPitch.x * cr + yawPitch.y * sr,
+    -yawPitch.x * sr + yawPitch.y * cr,
+    yawPitch.w * sr + yawPitch.z * cr,
+    yawPitch.w * cr - yawPitch.z * sr,
+  ]);
+};
+
+const createFlightState = (bank = 0, heading = 0) => {
+  const pitch = 2.2 * D2R;
+  const safeBank = Number.isFinite(bank) ? wrapRadians(bank) : 0;
+  const safeHeading = Number.isFinite(heading) ? wrapRadians(heading) : 0;
+
+  return {
+  quaternion: quaternionFromFlightAngles(safeBank, pitch, safeHeading),
+  pitch,
   pitchRate: 0,
-  heading: 0,
+  heading: safeHeading,
   altitude: FLIGHT_MODEL.targetAltitude,
   north: 0,
   east: 0,
@@ -128,35 +166,25 @@ const createFlightState = () => ({
   aoa: 2.2,
   turnRate: 0,
   thrust: 0,
-});
+  };
+};
 
 const normaliseQuaternion = quaternion => {
   const magnitude = Math.hypot(...quaternion) || 1;
   return quaternion.map(value => value / magnitude);
 };
 
-const integrateQuaternion = (quaternion, pitchRate, yawRate, rollRate, dt) => {
-  const [x, y, z, w] = quaternion;
-  // The rendered aircraft points along +Z: pitch=X, yaw=Y, roll=Z.
-  const ox = pitchRate;
-  const oy = yawRate;
-  const oz = -rollRate;
-  return normaliseQuaternion([
-    x + 0.5 * ( w * ox + y * oz - z * oy) * dt,
-    y + 0.5 * ( w * oy + z * ox - x * oz) * dt,
-    z + 0.5 * ( w * oz + x * oy - y * ox) * dt,
-    w + 0.5 * (-x * ox - y * oy - z * oz) * dt,
-  ]);
-};
-
 const integrateFlightPhysics = (flight, X, controlCommand, dt, gustInput) => {
   const [beta, p, r, phi, da] = X;
   const model = FLIGHT_MODEL;
+  const safePhi = Number.isFinite(phi)
+    ? clamp(wrapRadians(phi), -85 * D2R, 85 * D2R)
+    : 0;
 
   const density = 1.225 * Math.exp(-Math.max(0, flight.altitude) / 8500);
   const speedOfSound = 340.3 - Math.min(45, flight.altitude * 0.003);
   const dynamicPressure = 0.5 * density * flight.airspeed * flight.airspeed;
-  const bankCosine = Math.max(0.24, Math.cos(phi));
+  const bankCosine = Math.max(0.24, Math.cos(safePhi));
   const commandedLoad = clamp(1 / bankCosine, 0.35, 8.5);
   const liftCoefficient = clamp(
     commandedLoad * model.massKg * model.gravity /
@@ -184,25 +212,33 @@ const integrateFlightPhysics = (flight, X, controlCommand, dt, gustInput) => {
     2.8 * (targetPitch - flight.pitch) -
     2.1 * flight.pitchRate +
     0.00004 * gustInput;
-  const nextPitchRate = flight.pitchRate + pitchAcceleration * dt;
-  const nextPitch = flight.pitch + nextPitchRate * dt;
+  const nextPitchRate = clamp(
+    flight.pitchRate + pitchAcceleration * dt,
+    -30 * D2R,
+    30 * D2R
+  );
+  const nextPitch = clamp(
+    flight.pitch + nextPitchRate * dt,
+    -15 * D2R,
+    15 * D2R
+  );
 
   const coordinatedTurnRate =
-    model.gravity * Math.tan(clamp(phi, -78 * D2R, 78 * D2R)) /
+    model.gravity * Math.tan(clamp(safePhi, -78 * D2R, 78 * D2R)) /
     Math.max(80, flight.airspeed);
   const yawRate = coordinatedTurnRate + 0.16 * r;
-  const nextHeading = flight.heading + yawRate * dt;
+  const nextHeading = wrapRadians(flight.heading + yawRate * dt);
   const verticalSpeed =
     flight.airspeed * Math.sin(nextPitch) -
-    0.12 * Math.abs(Math.sin(phi)) * flight.airspeed;
+    0.12 * Math.abs(Math.sin(safePhi)) * flight.airspeed;
   const horizontalSpeed = flight.airspeed * Math.cos(nextPitch);
 
-  flight.quaternion = integrateQuaternion(
-    flight.quaternion,
-    nextPitchRate,
-    yawRate,
-    p,
-    dt
+  // Keep the rendered attitude locked to the project model's roll angle.
+  // This prevents quaternion drift, gimbal-looking flips and mode-switch jumps.
+  flight.quaternion = quaternionFromFlightAngles(
+    safePhi,
+    nextPitch,
+    nextHeading
   );
   flight.pitchRate = nextPitchRate;
   flight.pitch = nextPitch;
@@ -227,10 +263,20 @@ const integrateFlightPhysics = (flight, X, controlCommand, dt, gustInput) => {
   flight.turnRate = yawRate * R2D;
   flight.thrust = thrust;
 
+  if (
+    !flight.quaternion.every(Number.isFinite) ||
+    !Number.isFinite(flight.pitch) ||
+    !Number.isFinite(flight.heading) ||
+    !Number.isFinite(flight.altitude) ||
+    !Number.isFinite(flight.airspeed)
+  ) {
+    return createFlightState(safePhi, nextHeading);
+  }
+
   return flight;
 };
 
-const computeControl = (X, phiCmdRad, ctrlType, measuredPhi = X[3]) => {
+const computeRawControl = (X, phiCmdRad, ctrlType, measuredPhi = X[3]) => {
   const [beta, p, r, , da, xc, xi] = X;
   const error = phiCmdRad - measuredPhi;
 
@@ -268,6 +314,13 @@ const computeControl = (X, phiCmdRad, ctrlType, measuredPhi = X[3]) => {
   }
 };
 
+const computeControl = (X, phiCmdRad, ctrlType, measuredPhi = X[3]) =>
+  clamp(
+    computeRawControl(X, phiCmdRad, ctrlType, measuredPhi),
+    -MAX_AILERON_RAD,
+    MAX_AILERON_RAD
+  );
+
 // Physics derivatives based on the final five-state aircraft model.
 // X = [beta, p, r, phi, delta_a, x_lead, x_i]
 const getDerivatives = (
@@ -282,7 +335,8 @@ const getDerivatives = (
   // The same sampled measurement must be used throughout one RK4 step.
   const measuredPhi = phi + measurementNoiseRad;
   const error = phiCmdRad - measuredPhi;
-  const dc = computeControl(X, phiCmdRad, ctrlType, measuredPhi);
+  const rawDc = computeRawControl(X, phiCmdRad, ctrlType, measuredPhi);
+  const dc = clamp(rawDc, -MAX_AILERON_RAD, MAX_AILERON_RAD);
 
   const dBeta = -0.575 * beta - r + 0.0536 * phi - 0.078 * da;
   const dP = -300 * beta - 3.03 * p + 2 * r + 64.4 * da + windGust;
@@ -292,7 +346,10 @@ const getDerivatives = (
 
   // Controller internal states are active only for their own architecture.
   const dXc = ctrlType === 'Lead' ? -LEAD_POLE * xc + error : 0;
-  const dXi = ctrlType === 'LQServo' ? error : 0;
+  const dXi =
+    ctrlType === 'LQServo'
+      ? error + LQ_ANTI_WINDUP_GAIN * (dc - rawDc)
+      : 0;
 
   return [dBeta, dP, dR, dPhi, dDa, dXc, dXi];
 };
@@ -916,7 +973,7 @@ export default function AdvancedAircraftSimulation() {
     beta: 0,
     da: 0,
     dc: 0,
-    ess: 0,
+    ess: 30,
     time: 0,
     maxDa: 0,
     maxDc: 0,
@@ -1126,7 +1183,7 @@ export default function AdvancedAircraftSimulation() {
           );
 
           if (physicsMode === 'advanced') {
-            integrateFlightPhysics(
+            sim.current.flight = integrateFlightPhysics(
               sim.current.flight,
               sim.current.X,
               getControlEffort(
@@ -1299,16 +1356,6 @@ export default function AdvancedAircraftSimulation() {
     return () => cancelAnimationFrame(requestRef.current);
   }, [paused, noiseLvl, simSpeed, physicsMode, showEnvironmentFx]);
 
-  const handleControllerChange = (c) => {
-    setController(c);
-    sim.current.ctrlType = c;
-
-    // Avoid carrying hidden compensator/integrator memory between controllers.
-    sim.current.X[5] = 0;
-    sim.current.X[6] = 0;
-    sim.current.history = [];
-  };
-
   const triggerGust = () => {
     sim.current.windGust = 80; // Short stress-test disturbance in p-dot
   };
@@ -1327,7 +1374,7 @@ export default function AdvancedAircraftSimulation() {
       beta: 0,
       da: 0,
       dc: 0,
-      ess: 0,
+      ess: sim.current.phi_cmd_rad * R2D,
       time: 0,
       maxDa: 0,
       maxDc: 0,
@@ -1346,6 +1393,14 @@ export default function AdvancedAircraftSimulation() {
     targetRotation.current = { x: 0, y: Math.PI / 8 };
     currentRotation.current = { x: 0, y: Math.PI / 8 };
     lastTimeRef.current = undefined;
+  };
+
+  const handleControllerChange = (c) => {
+    setController(c);
+    sim.current.ctrlType = c;
+    // Each architecture starts from the same clean initial condition.
+    // This avoids hidden controller memory and non-physical switching spikes.
+    resetSim();
   };
 
   // 3D Canvas Mouse Events
@@ -1367,7 +1422,10 @@ export default function AdvancedAircraftSimulation() {
 
   const handlePhysicsModeChange = mode => {
     setPhysicsMode(mode);
-    sim.current.flight = createFlightState();
+    sim.current.flight = createFlightState(
+      sim.current.X[3],
+      sim.current.flight?.heading ?? 0
+    );
     lastTimeRef.current = undefined;
   };
 
