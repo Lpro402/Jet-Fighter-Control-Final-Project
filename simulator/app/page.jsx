@@ -47,6 +47,189 @@ const STATE_NR = 0.00551719;
 
 const clamp = (value, min, max) => Math.min(max, Math.max(min, value));
 
+const CONTROL_ARCHITECTURES = {
+  P: {
+    formula: 'δc = Kφ(φc − φ)',
+    controllerLabel: 'P GAIN',
+    controllerValue: `Kφ = ${P_GAIN.toFixed(5)}`,
+    summary: 'חוג משוב יחידה פשוט על זווית הגלגול.',
+    feedback: [
+      { label: 'Angle feedback', signal: 'φ', valueKey: 'phi', unit: '°' },
+    ],
+  },
+  PD: {
+    formula: 'δc = Kφ(φc − φ) − Kp·p',
+    controllerLabel: 'ANGLE + RATE',
+    controllerValue: `Kφ=${RATE_PHI_GAIN.toFixed(5)}  Kp=${RATE_P_GAIN.toFixed(3)}`,
+    summary: 'חוג זווית חיצוני עם משוב קצב גלגול פנימי.',
+    feedback: [
+      { label: 'Angle feedback', signal: 'φ', valueKey: 'phi', unit: '°' },
+      { label: 'Rate feedback', signal: 'p', valueKey: 'p', unit: '°/s' },
+    ],
+  },
+  Lead: {
+    formula: 'Clead(s) = 0.39697(s+3)/(s+15)',
+    controllerLabel: 'PHASE LEAD',
+    controllerValue: 'zero −3  |  pole −15',
+    summary: 'רשת קידום פאזה דינמית שמאיצה את תגובת החוג.',
+    feedback: [
+      { label: 'Angle feedback', signal: 'φ', valueKey: 'phi', unit: '°' },
+      { label: 'Lead state', signal: 'xc', valueKey: 'xc', unit: '' },
+    ],
+  },
+  FullState: {
+    formula: 'δc = Nr·φc − Kx',
+    controllerLabel: 'STATE FEEDBACK',
+    controllerValue: `Nr = ${STATE_NR.toFixed(6)}`,
+    summary: 'משוב מכל מצבי המטוס עם קדם־מסנן לפקודת הייחוס.',
+    feedback: [
+      { label: 'Sideslip', signal: 'β', valueKey: 'beta', unit: '°' },
+      { label: 'Roll rate', signal: 'p', valueKey: 'p', unit: '°/s' },
+      { label: 'Roll angle', signal: 'φ', valueKey: 'phi', unit: '°' },
+      { label: 'Aileron', signal: 'δa', valueKey: 'da', unit: '°' },
+    ],
+  },
+  LQServo: {
+    formula: 'δc = −Kx + Ki∫(φc − φ)dt',
+    controllerLabel: 'LQ SERVO / LQI',
+    controllerValue: 'optimal state + integral feedback',
+    summary: 'בקר אופטימלי עם אינטגרטור שמבטל שגיאת מצב מתמיד.',
+    feedback: [
+      { label: 'State vector', signal: 'x', valueKey: 'phi', unit: '° φ' },
+      { label: 'Error integral', signal: 'ξ', valueKey: 'xi', unit: '' },
+    ],
+  },
+};
+
+const FLIGHT_MODEL = {
+  massKg: 12000,
+  wingAreaM2: 27.87,
+  gravity: 9.80665,
+  targetAirspeed: 220,
+  targetAltitude: 3500,
+  maxThrustN: 85000,
+  cd0: 0.022,
+  inducedDrag: 0.075,
+};
+
+const createFlightState = () => ({
+  quaternion: [0, 0, 0, 1],
+  pitch: 2.2 * D2R,
+  pitchRate: 0,
+  heading: 0,
+  altitude: FLIGHT_MODEL.targetAltitude,
+  north: 0,
+  east: 0,
+  verticalSpeed: 0,
+  airspeed: FLIGHT_MODEL.targetAirspeed,
+  mach: 0.66,
+  dynamicPressure: 0,
+  loadFactor: 1,
+  aoa: 2.2,
+  turnRate: 0,
+  thrust: 0,
+});
+
+const normaliseQuaternion = quaternion => {
+  const magnitude = Math.hypot(...quaternion) || 1;
+  return quaternion.map(value => value / magnitude);
+};
+
+const integrateQuaternion = (quaternion, pitchRate, yawRate, rollRate, dt) => {
+  const [x, y, z, w] = quaternion;
+  // The rendered aircraft points along +Z: pitch=X, yaw=Y, roll=Z.
+  const ox = pitchRate;
+  const oy = yawRate;
+  const oz = -rollRate;
+  return normaliseQuaternion([
+    x + 0.5 * ( w * ox + y * oz - z * oy) * dt,
+    y + 0.5 * ( w * oy + z * ox - x * oz) * dt,
+    z + 0.5 * ( w * oz + x * oy - y * ox) * dt,
+    w + 0.5 * (-x * ox - y * oy - z * oz) * dt,
+  ]);
+};
+
+const integrateFlightPhysics = (flight, X, controlCommand, dt, gustInput) => {
+  const [beta, p, r, phi, da] = X;
+  const model = FLIGHT_MODEL;
+
+  const density = 1.225 * Math.exp(-Math.max(0, flight.altitude) / 8500);
+  const speedOfSound = 340.3 - Math.min(45, flight.altitude * 0.003);
+  const dynamicPressure = 0.5 * density * flight.airspeed * flight.airspeed;
+  const bankCosine = Math.max(0.24, Math.cos(phi));
+  const commandedLoad = clamp(1 / bankCosine, 0.35, 8.5);
+  const liftCoefficient = clamp(
+    commandedLoad * model.massKg * model.gravity /
+      Math.max(1, dynamicPressure * model.wingAreaM2),
+    -0.5,
+    1.45
+  );
+  const dragCoefficient =
+    model.cd0 +
+    model.inducedDrag * liftCoefficient * liftCoefficient +
+    0.004 * Math.abs(beta / D2R) +
+    0.0015 * Math.abs(da / D2R);
+  const drag = dynamicPressure * model.wingAreaM2 * dragCoefficient;
+  const speedHold = model.massKg * 0.42 * (model.targetAirspeed - flight.airspeed);
+  const thrust = clamp(drag + speedHold, 0, model.maxThrustN);
+  const airspeedDot = (thrust - drag) / model.massKg;
+
+  const altitudeError = model.targetAltitude - flight.altitude;
+  const targetPitch = clamp(
+    2.2 * D2R + altitudeError * 0.00016 - flight.verticalSpeed * 0.0025,
+    -10 * D2R,
+    12 * D2R
+  );
+  const pitchAcceleration =
+    2.8 * (targetPitch - flight.pitch) -
+    2.1 * flight.pitchRate +
+    0.00004 * gustInput;
+  const nextPitchRate = flight.pitchRate + pitchAcceleration * dt;
+  const nextPitch = flight.pitch + nextPitchRate * dt;
+
+  const coordinatedTurnRate =
+    model.gravity * Math.tan(clamp(phi, -78 * D2R, 78 * D2R)) /
+    Math.max(80, flight.airspeed);
+  const yawRate = coordinatedTurnRate + 0.16 * r;
+  const nextHeading = flight.heading + yawRate * dt;
+  const verticalSpeed =
+    flight.airspeed * Math.sin(nextPitch) -
+    0.12 * Math.abs(Math.sin(phi)) * flight.airspeed;
+  const horizontalSpeed = flight.airspeed * Math.cos(nextPitch);
+
+  flight.quaternion = integrateQuaternion(
+    flight.quaternion,
+    nextPitchRate,
+    yawRate,
+    p,
+    dt
+  );
+  flight.pitchRate = nextPitchRate;
+  flight.pitch = nextPitch;
+  flight.heading = nextHeading;
+  flight.altitude = Math.max(80, flight.altitude + verticalSpeed * dt);
+  flight.verticalSpeed = verticalSpeed;
+  flight.airspeed = clamp(flight.airspeed + airspeedDot * dt, 95, 340);
+  flight.north += horizontalSpeed * Math.cos(nextHeading) * dt;
+  flight.east += horizontalSpeed * Math.sin(nextHeading) * dt;
+  flight.mach = flight.airspeed / Math.max(280, speedOfSound);
+  flight.dynamicPressure = dynamicPressure;
+  flight.loadFactor = clamp(
+    commandedLoad + 0.025 * Math.abs(controlCommand / D2R),
+    0,
+    9
+  );
+  flight.aoa = clamp(
+    liftCoefficient * 7.6 + 0.16 * Math.abs(beta / D2R),
+    -4,
+    18
+  );
+  flight.turnRate = yawRate * R2D;
+  flight.thrust = thrust;
+
+  return flight;
+};
+
 const computeControl = (X, phiCmdRad, ctrlType, measuredPhi = X[3]) => {
   const [beta, p, r, , da, xc, xi] = X;
   const error = phiCmdRad - measuredPhi;
@@ -241,6 +424,32 @@ const buildAdvancedAirplane = () => {
   leftAileron.position.set(-2.0, 0, -2.0);
   group.add(leftAileron);
 
+  // Horizontal stabilators
+  const stabilatorGeom = new THREE.BoxGeometry(1.65, 0.07, 0.58);
+  const rightStabilator = new THREE.Mesh(stabilatorGeom, matControlSurface);
+  rightStabilator.position.set(0.95, 0.02, -2.05);
+  rightStabilator.rotation.y = -0.14;
+  group.add(rightStabilator);
+
+  const leftStabilator = rightStabilator.clone();
+  leftStabilator.position.x = -0.95;
+  leftStabilator.rotation.y = 0.14;
+  group.add(leftStabilator);
+
+  // Twin side intakes give the model a more credible modern-fighter silhouette.
+  const intakeGeom = new THREE.BoxGeometry(0.34, 0.38, 1.25);
+  const intakeMaterial = new THREE.MeshStandardMaterial({
+    color: 0x172033,
+    roughness: 0.42,
+    metalness: 0.55,
+  });
+  const rightIntake = new THREE.Mesh(intakeGeom, intakeMaterial);
+  rightIntake.position.set(0.46, -0.18, 0.35);
+  group.add(rightIntake);
+  const leftIntake = rightIntake.clone();
+  leftIntake.position.x = -0.46;
+  group.add(leftIntake);
+
   // Vertical Tail
   const vTailShape = new THREE.Shape();
   vTailShape.moveTo(0,0);
@@ -269,7 +478,39 @@ const buildAdvancedAirplane = () => {
   const afterburner = new THREE.Mesh(abGeom, matAb);
   group.add(afterburner);
 
-  return { airplaneGroup: group, leftAileron, rightAileron, engine, afterburner };
+  // Navigation lights and wing-tip strobes.
+  const navRed = new THREE.PointLight(0xff334f, 2.4, 5);
+  navRed.position.set(-3.15, 0.08, -1.45);
+  group.add(navRed);
+  const navGreen = new THREE.PointLight(0x22c55e, 2.4, 5);
+  navGreen.position.set(3.15, 0.08, -1.45);
+  group.add(navGreen);
+
+  const wingTipGeometry = new THREE.SphereGeometry(0.055, 12, 12);
+  const redTip = new THREE.Mesh(
+    wingTipGeometry,
+    new THREE.MeshBasicMaterial({ color: 0xff334f })
+  );
+  redTip.position.copy(navRed.position);
+  group.add(redTip);
+  const greenTip = new THREE.Mesh(
+    wingTipGeometry,
+    new THREE.MeshBasicMaterial({ color: 0x22c55e })
+  );
+  greenTip.position.copy(navGreen.position);
+  group.add(greenTip);
+
+  return {
+    airplaneGroup: group,
+    leftAileron,
+    rightAileron,
+    rightStabilator,
+    leftStabilator,
+    engine,
+    afterburner,
+    navRed,
+    navGreen,
+  };
 };
 
 const drawOscilloscope = (canvas, history, key1, key2, color1, color2, min, max, label1, label2, showLimits = false) => {
@@ -529,6 +770,138 @@ const AttitudeIndicator = ({ roll, pitch = 0 }) => {
   );
 };
 
+const FlowLink = ({ label, color, paused, reverse = false }) => (
+  <div
+    className={`control-flow-link ${reverse ? 'is-reverse' : ''} ${paused ? 'is-paused' : ''}`}
+    style={{ '--flow-color': color }}
+    aria-hidden="true"
+  >
+    {label && <span className="control-flow-label">{label}</span>}
+    <span className="control-flow-pulse" />
+  </div>
+);
+
+const DiagramNode = ({ eyebrow, title, value, color, compact = false }) => (
+  <div
+    className={`control-diagram-node ${compact ? 'is-compact' : ''}`}
+    style={{ '--node-color': color }}
+  >
+    <span className="control-node-eyebrow">{eyebrow}</span>
+    <strong>{title}</strong>
+    <span className="control-node-value" dir="ltr">{value}</span>
+  </div>
+);
+
+const LiveControlArchitecture = ({ controller, cmdDeg, stats, paused }) => {
+  const info = CONTROLLERS[controller];
+  const architecture = CONTROL_ARCHITECTURES[controller];
+  const activity = clamp(Math.abs(stats.dc) / 5, 0.18, 1);
+
+  return (
+    <section
+      className="control-architecture-panel"
+      style={{
+        '--controller-color': info.color,
+        '--controller-glow': info.glow,
+        '--flow-duration': `${(1.65 - activity).toFixed(2)}s`,
+      }}
+      aria-labelledby="control-architecture-title"
+    >
+      <div className="control-architecture-header">
+        <div>
+          <span className="control-section-kicker">LIVE CONTROL ARCHITECTURE</span>
+          <h2 id="control-architecture-title">דיאגרמת חוג הבקרה הפעיל</h2>
+          <p>{architecture.summary}</p>
+        </div>
+        <div className="control-formula-card" dir="ltr">
+          <span className={`control-live-dot ${paused ? 'is-paused' : ''}`} />
+          <div>
+            <span>{paused ? 'FLOW PAUSED' : 'LIVE SIGNAL FLOW'}</span>
+            <strong>{architecture.formula}</strong>
+          </div>
+        </div>
+      </div>
+
+      <div className="control-diagram-scroll" dir="ltr">
+        <div className="control-diagram-stage">
+          <div className="control-scan-line" />
+          <div className="control-main-loop">
+            <DiagramNode
+              eyebrow="REFERENCE"
+              title="Roll command"
+              value={`φc = ${cmdDeg.toFixed(1)}°`}
+              color={info.color}
+              compact
+            />
+            <FlowLink label="φc" color={info.color} paused={paused} />
+            <DiagramNode
+              eyebrow="ERROR JUNCTION"
+              title="Σ"
+              value={`e = ${stats.ess.toFixed(2)}°`}
+              color="#fbbf24"
+              compact
+            />
+            <FlowLink label="e(t)" color="#fbbf24" paused={paused} />
+            <DiagramNode
+              eyebrow={architecture.controllerLabel}
+              title={info.name}
+              value={architecture.controllerValue}
+              color={info.color}
+            />
+            <FlowLink label={`δc ${stats.dc.toFixed(2)}°`} color="#e879f9" paused={paused} />
+            <DiagramNode
+              eyebrow="ACTUATOR"
+              title="Aileron servo"
+              value={`δa = ${stats.da.toFixed(2)}°`}
+              color="#fb7185"
+            />
+            <FlowLink label="δa" color="#fb7185" paused={paused} />
+            <DiagramNode
+              eyebrow="AIRCRAFT"
+              title="Lateral dynamics"
+              value={`β ${stats.beta.toFixed(2)}° · p ${stats.p.toFixed(2)}°/s`}
+              color="#38bdf8"
+            />
+            <FlowLink label="φ" color="#38bdf8" paused={paused} />
+            <DiagramNode
+              eyebrow="OUTPUT"
+              title="Roll angle"
+              value={`φ = ${stats.phi.toFixed(2)}°`}
+              color="#34d399"
+              compact
+            />
+          </div>
+
+          <div className="control-feedback-zone">
+            <div className="control-feedback-return">
+              <span className="control-return-corner" />
+              <FlowLink label="measured feedback" color={info.color} paused={paused} reverse />
+              <span className="control-return-corner is-left" />
+            </div>
+            <div className="control-feedback-cards">
+              {architecture.feedback.map(item => (
+                <div className="control-feedback-chip" key={`${controller}-${item.signal}`}>
+                  <span>{item.label}</span>
+                  <strong dir="ltr">
+                    {item.signal} = {Number(stats[item.valueKey] || 0).toFixed(2)}{item.unit}
+                  </strong>
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div className="control-architecture-footer">
+        <span><i style={{ background: info.color }} /> Active controller: <strong>{info.name}</strong></span>
+        <span dir="ltr">|e| {Math.abs(stats.ess).toFixed(2)}°</span>
+        <span dir="ltr">|δa|max {stats.maxDa.toFixed(2)}°</span>
+        <span dir="ltr">t = {stats.time.toFixed(2)} s</span>
+      </div>
+    </section>
+  );
+};
+
 export default function AdvancedAircraftSimulation() {
   const mountRef = useRef(null);
   const chartRollRef = useRef(null);
@@ -547,9 +920,24 @@ export default function AdvancedAircraftSimulation() {
     time: 0,
     maxDa: 0,
     maxDc: 0,
+    xc: 0,
+    xi: 0,
+    airspeed: FLIGHT_MODEL.targetAirspeed,
+    mach: 0.66,
+    altitude: FLIGHT_MODEL.targetAltitude,
+    heading: 0,
+    gLoad: 1,
+    aoa: 2.2,
+    pitch: 2.2,
+    verticalSpeed: 0,
+    turnRate: 0,
   });
   const [noiseLvl, setNoiseLvl] = useState(0);
   const [simSpeed, setSimSpeed] = useState(1);
+  const [physicsMode, setPhysicsMode] = useState('advanced');
+  const [showAdvancedHud, setShowAdvancedHud] = useState(true);
+  const [showEnvironmentFx, setShowEnvironmentFx] = useState(true);
+  const [showControlDiagram, setShowControlDiagram] = useState(true);
 
   const sim = useRef({
     X: [0, 0, 0, 0, 0, 0, 0], 
@@ -560,6 +948,7 @@ export default function AdvancedAircraftSimulation() {
     windGust: 0,
     maxDa: 0,
     maxDc: 0,
+    flight: createFlightState(),
   });
 
   const sceneRefs = useRef({});
@@ -638,13 +1027,39 @@ export default function AdvancedAircraftSimulation() {
     const particles = new THREE.Points(particlesGeo, particlesMat);
     scene.add(particles);
 
-    const { airplaneGroup, leftAileron, rightAileron, engine, afterburner } = buildAdvancedAirplane();
+    const {
+      airplaneGroup,
+      leftAileron,
+      rightAileron,
+      rightStabilator,
+      leftStabilator,
+      engine,
+      afterburner,
+      navRed,
+      navGreen,
+    } = buildAdvancedAirplane();
     
     const rotationWrapper = new THREE.Group();
     rotationWrapper.add(airplaneGroup);
     scene.add(rotationWrapper);
 
-    sceneRefs.current = { scene, camera, renderer, airplaneGroup, leftAileron, rightAileron, engine, afterburner, grid, particles, rotationWrapper };
+    sceneRefs.current = {
+      scene,
+      camera,
+      renderer,
+      airplaneGroup,
+      leftAileron,
+      rightAileron,
+      rightStabilator,
+      leftStabilator,
+      engine,
+      afterburner,
+      navRed,
+      navGreen,
+      grid,
+      particles,
+      rotationWrapper,
+    };
 
     const handleResize = () => {
       if(!mountRef.current) return;
@@ -710,6 +1125,20 @@ export default function AdvancedAircraftSimulation() {
             sim.current.windGust
           );
 
+          if (physicsMode === 'advanced') {
+            integrateFlightPhysics(
+              sim.current.flight,
+              sim.current.X,
+              getControlEffort(
+                sim.current.X,
+                sim.current.phi_cmd_rad,
+                sim.current.ctrlType
+              ),
+              integrationDt,
+              sim.current.windGust
+            );
+          }
+
           // Time-based gust decay, independent of monitor frame rate.
           sim.current.windGust *= Math.exp(-3 * integrationDt);
           sim.current.time += integrationDt;
@@ -732,28 +1161,74 @@ export default function AdvancedAircraftSimulation() {
           beta: currentBeta,
           da: currentDa,
           dc: currentDc,
+          airspeed: sim.current.flight.airspeed,
+          altitude: sim.current.flight.altitude,
+          mach: sim.current.flight.mach,
+          gLoad: sim.current.flight.loadFactor,
         });
         if (sim.current.history.length > 600) sim.current.history.shift();
 
-        const { airplaneGroup, leftAileron, rightAileron, engine, afterburner, grid, particles, renderer, scene, camera, rotationWrapper } = sceneRefs.current;
+        const {
+          airplaneGroup,
+          leftAileron,
+          rightAileron,
+          rightStabilator,
+          leftStabilator,
+          engine,
+          afterburner,
+          navRed,
+          navGreen,
+          grid,
+          particles,
+          renderer,
+          scene,
+          camera,
+          rotationWrapper,
+        } = sceneRefs.current;
         
         if (airplaneGroup && leftAileron && rightAileron && engine && afterburner && grid && particles) {
-          // Physics application to 3D model
-          airplaneGroup.rotation.z = -sim.current.X[3];
-          airplaneGroup.rotation.y = sim.current.X[0] * 3; // exaggerate beta slightly for visual
-          airplaneGroup.rotation.x = Math.abs(sim.current.X[3]) * 0.05; // slight pitch up on roll
+          if (physicsMode === 'advanced') {
+            const [qx, qy, qz, qw] = sim.current.flight.quaternion;
+            airplaneGroup.quaternion.set(qx, qy, qz, qw);
+          } else {
+            // Project mode mirrors the submitted five-state model directly.
+            airplaneGroup.rotation.set(
+              Math.abs(sim.current.X[3]) * 0.05,
+              sim.current.X[0] * 3,
+              -sim.current.X[3]
+            );
+          }
           
           leftAileron.rotation.x = sim.current.X[4];
           rightAileron.rotation.x = -sim.current.X[4];
+          if (leftStabilator && rightStabilator) {
+            const stabilatorAngle =
+              physicsMode === 'advanced'
+                ? clamp(-sim.current.flight.pitchRate * 0.35, -0.28, 0.28)
+                : 0;
+            leftStabilator.rotation.x = stabilatorAngle;
+            rightStabilator.rotation.x = stabilatorAngle;
+          }
 
           // Engine flicker based on time and noise
           const flicker = 0.8 + Math.random() * 0.2;
           engine.material.color.setHex(Math.random() > 0.5 ? 0x0ea5e9 : 0x38bdf8);
-          afterburner.scale.set(1, 1, flicker + Math.abs(currentDa)*0.1); // afterburner reacts to effort
-          afterburner.material.opacity = 0.5 * flicker;
+          const thrustRatio =
+            physicsMode === 'advanced'
+              ? sim.current.flight.thrust / FLIGHT_MODEL.maxThrustN
+              : 0.72 + Math.abs(currentDa) * 0.02;
+          afterburner.scale.set(1, 1, 0.65 + flicker * clamp(thrustRatio, 0.2, 1.15));
+          afterburner.material.opacity = 0.34 + 0.42 * clamp(thrustRatio, 0, 1);
+          if (navRed && navGreen) {
+            const strobe = Math.sin(sim.current.time * 7.5) > 0.82 ? 4.6 : 1.6;
+            navRed.intensity = showEnvironmentFx ? strobe : 0;
+            navGreen.intensity = showEnvironmentFx ? strobe : 0;
+          }
 
           // Move Grid
           grid.position.z = (sim.current.time * 15) % 2;
+          grid.visible = showEnvironmentFx;
+          particles.visible = showEnvironmentFx;
           
           // Animate Speed Lines (Particles)
           const positions = particles.geometry.attributes.position.array;
@@ -800,6 +1275,17 @@ export default function AdvancedAircraftSimulation() {
             time: sim.current.time,
             maxDa: sim.current.maxDa,
             maxDc: sim.current.maxDc,
+            xc: sim.current.X[5],
+            xi: sim.current.X[6],
+            airspeed: sim.current.flight.airspeed,
+            mach: sim.current.flight.mach,
+            altitude: sim.current.flight.altitude,
+            heading: ((sim.current.flight.heading * R2D) % 360 + 360) % 360,
+            gLoad: sim.current.flight.loadFactor,
+            aoa: sim.current.flight.aoa,
+            pitch: sim.current.flight.pitch * R2D,
+            verticalSpeed: sim.current.flight.verticalSpeed,
+            turnRate: sim.current.flight.turnRate,
           });
           lastUiUpdate = time;
         }
@@ -811,7 +1297,7 @@ export default function AdvancedAircraftSimulation() {
     
     requestRef.current = requestAnimationFrame(animate);
     return () => cancelAnimationFrame(requestRef.current);
-  }, [paused, noiseLvl, simSpeed]);
+  }, [paused, noiseLvl, simSpeed, physicsMode, showEnvironmentFx]);
 
   const handleControllerChange = (c) => {
     setController(c);
@@ -834,6 +1320,7 @@ export default function AdvancedAircraftSimulation() {
     sim.current.windGust = 0;
     sim.current.maxDa = 0;
     sim.current.maxDc = 0;
+    sim.current.flight = createFlightState();
     setStats({
       phi: 0,
       p: 0,
@@ -844,6 +1331,17 @@ export default function AdvancedAircraftSimulation() {
       time: 0,
       maxDa: 0,
       maxDc: 0,
+      xc: 0,
+      xi: 0,
+      airspeed: FLIGHT_MODEL.targetAirspeed,
+      mach: 0.66,
+      altitude: FLIGHT_MODEL.targetAltitude,
+      heading: 0,
+      gLoad: 1,
+      aoa: 2.2,
+      pitch: 2.2,
+      verticalSpeed: 0,
+      turnRate: 0,
     });
     targetRotation.current = { x: 0, y: Math.PI / 8 };
     currentRotation.current = { x: 0, y: Math.PI / 8 };
@@ -867,20 +1365,45 @@ export default function AdvancedAircraftSimulation() {
     sim.current.phi_cmd_rad = deg * D2R;
   };
 
+  const handlePhysicsModeChange = mode => {
+    setPhysicsMode(mode);
+    sim.current.flight = createFlightState();
+    lastTimeRef.current = undefined;
+  };
+
   const exportTelemetry = () => {
     if (!sim.current.history.length) return;
 
     const rows = [
-      ['time_s', 'controller', 'phi_cmd_deg', 'phi_deg', 'p_deg_s', 'beta_deg', 'delta_a_deg', 'delta_c_deg'],
+      [
+        'time_s',
+        'controller',
+        'physics_mode',
+        'phi_cmd_deg',
+        'phi_deg',
+        'p_deg_s',
+        'beta_deg',
+        'delta_a_deg',
+        'delta_c_deg',
+        'airspeed_m_s',
+        'altitude_m',
+        'mach',
+        'g_load',
+      ],
       ...sim.current.history.map(point => [
         point.t.toFixed(4),
         sim.current.ctrlType,
+        physicsMode,
         point.phic.toFixed(5),
         point.phi.toFixed(5),
         point.p.toFixed(5),
         point.beta.toFixed(5),
         point.da.toFixed(5),
         point.dc.toFixed(5),
+        point.airspeed.toFixed(4),
+        point.altitude.toFixed(4),
+        point.mach.toFixed(5),
+        point.gLoad.toFixed(5),
       ]),
     ];
     const csv = rows.map(row => row.join(',')).join('\n');
@@ -954,13 +1477,41 @@ export default function AdvancedAircraftSimulation() {
           >
             {/* Attitude Indicator Overlay */}
             <div className="absolute top-6 left-6 flex gap-4 z-10 pointer-events-none">
-              <AttitudeIndicator roll={stats.phi} pitch={Math.abs(stats.phi) * 0.05} />
+              <AttitudeIndicator
+                roll={stats.phi}
+                pitch={physicsMode === 'advanced' ? stats.pitch : Math.abs(stats.phi) * 0.05}
+              />
             </div>
             
             {/* Time Overlay */}
             <div className="absolute top-6 right-6 bg-slate-900/80 border border-slate-600 px-4 py-2 rounded-lg text-sm font-mono text-sky-400 backdrop-blur-md pointer-events-none shadow-[0_0_15px_rgba(56,189,248,0.2)]" dir="ltr">
               TIME: {stats.time.toFixed(2)}s
             </div>
+
+            {showAdvancedHud && (
+              <>
+                <div className="flight-hud flight-hud-left" dir="ltr">
+                  <span>IAS</span>
+                  <strong>{stats.airspeed.toFixed(0)}</strong>
+                  <small>m/s · M {stats.mach.toFixed(2)}</small>
+                  <span>α {stats.aoa.toFixed(1)}°</span>
+                </div>
+                <div className="flight-hud flight-hud-right" dir="ltr">
+                  <span>ALT</span>
+                  <strong>{stats.altitude.toFixed(0)}</strong>
+                  <small>m · VS {stats.verticalSpeed.toFixed(1)} m/s</small>
+                  <span>HDG {stats.heading.toFixed(0).padStart(3, '0')}°</span>
+                </div>
+                <div className="flight-path-marker" aria-hidden="true">
+                  <span />
+                </div>
+                <div className="flight-load-strip" dir="ltr">
+                  <span>G {stats.gLoad.toFixed(2)}</span>
+                  <span>TURN {stats.turnRate.toFixed(2)}°/s</span>
+                  <span>{physicsMode === 'advanced' ? '6-DOF FLIGHT SHELL' : '5-STATE PROJECT MODEL'}</span>
+                </div>
+              </>
+            )}
 
             <div ref={mountRef} className="w-full h-full" />
             
@@ -995,6 +1546,63 @@ export default function AdvancedAircraftSimulation() {
                   <div className="text-[10px] opacity-80 leading-tight">{info.desc}</div>
                 </button>
               ))}
+            </div>
+          </div>
+
+          <div className="simulation-mode-panel">
+            <div className="simulation-mode-copy">
+              <span>SIMULATION FIDELITY</span>
+              <strong>מצב פיזיקה ותצוגה</strong>
+              <small>
+                מצב הפרויקט שומר על המודל הליניארי המקורי; המצב המתקדם מוסיף
+                קינמטיקה תלת־ממדית, אטמוספרה ואווירודינמיקה.
+              </small>
+            </div>
+            <div className="simulation-mode-actions">
+              <div className="simulation-segmented" dir="ltr">
+                <button
+                  type="button"
+                  onClick={() => handlePhysicsModeChange('project')}
+                  className={physicsMode === 'project' ? 'is-active' : ''}
+                >
+                  PROJECT MODEL
+                  <span>5-state</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => handlePhysicsModeChange('advanced')}
+                  className={physicsMode === 'advanced' ? 'is-active is-advanced' : ''}
+                >
+                  ADVANCED PHYSICS
+                  <span>6-DOF shell</span>
+                </button>
+              </div>
+              <div className="simulation-switches">
+                <label>
+                  <input
+                    type="checkbox"
+                    checked={showAdvancedHud}
+                    onChange={event => setShowAdvancedHud(event.target.checked)}
+                  />
+                  <span>HUD מתקדם</span>
+                </label>
+                <label>
+                  <input
+                    type="checkbox"
+                    checked={showEnvironmentFx}
+                    onChange={event => setShowEnvironmentFx(event.target.checked)}
+                  />
+                  <span>אפקטי סביבה</span>
+                </label>
+                <label>
+                  <input
+                    type="checkbox"
+                    checked={showControlDiagram}
+                    onChange={event => setShowControlDiagram(event.target.checked)}
+                  />
+                  <span>דיאגרמה חיה</span>
+                </label>
+              </div>
             </div>
           </div>
 
@@ -1119,6 +1727,15 @@ export default function AdvancedAircraftSimulation() {
 
         </div>
       </div>
+
+      {showControlDiagram && (
+        <LiveControlArchitecture
+          controller={controller}
+          cmdDeg={cmdDeg}
+          stats={stats}
+          paused={paused}
+        />
+      )}
     </div>
   );
 }

@@ -53,6 +53,619 @@ canvas {
   display: block;
 }
 
+.flight-hud {
+  position: absolute;
+  top: 38%;
+  z-index: 12;
+  display: grid;
+  width: 108px;
+  gap: 0.12rem;
+  border-inline-start: 2px solid rgba(52, 211, 153, 0.75);
+  padding: 0.55rem 0.65rem;
+  color: #86efac;
+  background: linear-gradient(90deg, rgba(2, 6, 23, 0.58), transparent);
+  font-family: "Cascadia Code", Consolas, monospace;
+  text-shadow: 0 0 8px rgba(52, 211, 153, 0.65);
+  pointer-events: none;
+}
+
+.flight-hud-left {
+  left: 1.25rem;
+}
+
+.flight-hud-right {
+  right: 1.25rem;
+  border-inline-start: 0;
+  border-inline-end: 2px solid rgba(52, 211, 153, 0.75);
+  background: linear-gradient(270deg, rgba(2, 6, 23, 0.58), transparent);
+  text-align: right;
+}
+
+.flight-hud span {
+  font-size: 0.65rem;
+  letter-spacing: 0.08em;
+}
+
+.flight-hud strong {
+  color: #dcfce7;
+  font-size: 1.45rem;
+  line-height: 1;
+}
+
+.flight-hud small {
+  color: rgba(134, 239, 172, 0.72);
+  font-size: 0.56rem;
+}
+
+.flight-path-marker {
+  position: absolute;
+  top: 49%;
+  left: 50%;
+  z-index: 12;
+  width: 54px;
+  height: 22px;
+  transform: translate(-50%, -50%);
+  border-bottom: 2px solid rgba(52, 211, 153, 0.82);
+  pointer-events: none;
+  filter: drop-shadow(0 0 5px rgba(52, 211, 153, 0.65));
+}
+
+.flight-path-marker::before,
+.flight-path-marker::after {
+  position: absolute;
+  bottom: -2px;
+  width: 11px;
+  height: 10px;
+  content: "";
+  border-top: 2px solid rgba(52, 211, 153, 0.82);
+}
+
+.flight-path-marker::before {
+  left: -10px;
+  transform: rotate(-18deg);
+}
+
+.flight-path-marker::after {
+  right: -10px;
+  transform: rotate(18deg);
+}
+
+.flight-path-marker span {
+  position: absolute;
+  left: 50%;
+  bottom: -8px;
+  width: 15px;
+  height: 15px;
+  transform: translateX(-50%);
+  border: 2px solid #86efac;
+  border-radius: 999px;
+}
+
+.flight-load-strip {
+  position: absolute;
+  right: 50%;
+  bottom: 3.15rem;
+  z-index: 12;
+  display: flex;
+  transform: translateX(50%);
+  gap: 0.85rem;
+  border: 1px solid rgba(52, 211, 153, 0.3);
+  border-radius: 999px;
+  padding: 0.35rem 0.75rem;
+  color: #86efac;
+  background: rgba(2, 6, 23, 0.68);
+  font: 600 0.58rem/1.2 "Cascadia Code", Consolas, monospace;
+  box-shadow: 0 0 18px rgba(52, 211, 153, 0.1);
+  pointer-events: none;
+}
+
+.simulation-mode-panel {
+  display: grid;
+  grid-template-columns: minmax(220px, 0.72fr) minmax(420px, 1.28fr);
+  align-items: center;
+  gap: 1.1rem;
+  border: 1px solid rgba(71, 85, 105, 0.6);
+  border-radius: 1rem;
+  padding: 1rem;
+  background:
+    radial-gradient(circle at 0 0, rgba(14, 165, 233, 0.09), transparent 40%),
+    rgba(15, 23, 42, 0.62);
+  box-shadow: 0 14px 30px rgba(0, 0, 0, 0.24);
+}
+
+.simulation-mode-copy {
+  display: grid;
+  gap: 0.2rem;
+}
+
+.simulation-mode-copy > span {
+  color: #38bdf8;
+  font: 700 0.62rem/1.2 "Cascadia Code", Consolas, monospace;
+  letter-spacing: 0.16em;
+}
+
+.simulation-mode-copy strong {
+  color: #f8fafc;
+  font-size: 0.92rem;
+}
+
+.simulation-mode-copy small {
+  color: #94a3b8;
+  font-size: 0.7rem;
+  line-height: 1.5;
+}
+
+.simulation-mode-actions {
+  display: grid;
+  gap: 0.7rem;
+}
+
+.simulation-segmented {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0.45rem;
+  padding: 0.3rem;
+  border: 1px solid #334155;
+  border-radius: 0.85rem;
+  background: #020617;
+}
+
+.simulation-segmented button {
+  display: grid;
+  gap: 0.1rem;
+  border: 1px solid transparent;
+  border-radius: 0.65rem;
+  padding: 0.58rem 0.7rem;
+  color: #64748b;
+  background: transparent;
+  font: 700 0.66rem/1.2 "Cascadia Code", Consolas, monospace;
+  cursor: pointer;
+  transition: 180ms ease;
+}
+
+.simulation-segmented button span {
+  font-size: 0.55rem;
+  font-weight: 500;
+  opacity: 0.75;
+}
+
+.simulation-segmented button:hover {
+  color: #cbd5e1;
+  background: rgba(30, 41, 59, 0.68);
+}
+
+.simulation-segmented button.is-active {
+  border-color: rgba(148, 163, 184, 0.52);
+  color: #f8fafc;
+  background: linear-gradient(145deg, #334155, #1e293b);
+  box-shadow: 0 0 18px rgba(148, 163, 184, 0.12);
+}
+
+.simulation-segmented button.is-active.is-advanced {
+  border-color: rgba(16, 185, 129, 0.58);
+  color: #a7f3d0;
+  background: linear-gradient(145deg, rgba(6, 78, 59, 0.84), rgba(2, 44, 34, 0.9));
+  box-shadow: 0 0 20px rgba(16, 185, 129, 0.16);
+}
+
+.simulation-switches {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.45rem;
+}
+
+.simulation-switches label {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.42rem;
+  border: 1px solid rgba(71, 85, 105, 0.65);
+  border-radius: 999px;
+  padding: 0.38rem 0.62rem;
+  color: #94a3b8;
+  background: rgba(2, 6, 23, 0.58);
+  font-size: 0.65rem;
+  cursor: pointer;
+}
+
+.simulation-switches input {
+  width: 0.86rem;
+  height: 0.86rem;
+  accent-color: #0ea5e9;
+}
+
+.control-architecture-panel {
+  --controller-color: #38bdf8;
+  position: relative;
+  z-index: 10;
+  overflow: hidden;
+  border: 1px solid color-mix(in srgb, var(--controller-color) 42%, #334155);
+  border-radius: 1.35rem;
+  padding: clamp(1rem, 2.2vw, 1.75rem);
+  background:
+    radial-gradient(circle at 10% 0%, color-mix(in srgb, var(--controller-color) 12%, transparent), transparent 34%),
+    linear-gradient(145deg, rgba(15, 23, 42, 0.94), rgba(2, 6, 23, 0.97));
+  box-shadow:
+    0 22px 55px rgba(0, 0, 0, 0.42),
+    inset 0 1px 0 rgba(255, 255, 255, 0.04),
+    0 0 35px color-mix(in srgb, var(--controller-color) 10%, transparent);
+}
+
+.control-architecture-panel::before {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  content: "";
+  opacity: 0.14;
+  background-image:
+    linear-gradient(rgba(56, 189, 248, 0.2) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(56, 189, 248, 0.2) 1px, transparent 1px);
+  background-size: 28px 28px;
+  mask-image: linear-gradient(to bottom, black, transparent 82%);
+}
+
+.control-architecture-header,
+.control-architecture-footer,
+.control-diagram-scroll {
+  position: relative;
+  z-index: 1;
+}
+
+.control-architecture-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 1rem;
+  margin-bottom: 1.25rem;
+}
+
+.control-section-kicker {
+  display: block;
+  margin-bottom: 0.25rem;
+  color: var(--controller-color);
+  font: 700 0.68rem/1.2 "Cascadia Code", Consolas, monospace;
+  letter-spacing: 0.2em;
+}
+
+.control-architecture-header h2 {
+  margin: 0;
+  color: #f8fafc;
+  font-size: clamp(1.15rem, 2vw, 1.65rem);
+  font-weight: 800;
+}
+
+.control-architecture-header p {
+  margin: 0.35rem 0 0;
+  color: #94a3b8;
+  font-size: 0.85rem;
+}
+
+.control-formula-card {
+  display: flex;
+  min-width: min(100%, 320px);
+  align-items: center;
+  gap: 0.8rem;
+  border: 1px solid color-mix(in srgb, var(--controller-color) 46%, #334155);
+  border-radius: 0.9rem;
+  padding: 0.8rem 1rem;
+  background: rgba(2, 6, 23, 0.78);
+  box-shadow: inset 0 0 24px color-mix(in srgb, var(--controller-color) 7%, transparent);
+}
+
+.control-formula-card div {
+  display: grid;
+  gap: 0.2rem;
+}
+
+.control-formula-card span {
+  color: #64748b;
+  font: 700 0.62rem/1.2 "Cascadia Code", Consolas, monospace;
+  letter-spacing: 0.12em;
+}
+
+.control-formula-card strong {
+  color: #e2e8f0;
+  font: 600 0.78rem/1.3 "Cascadia Code", Consolas, monospace;
+}
+
+.control-live-dot {
+  width: 0.72rem;
+  height: 0.72rem;
+  flex: 0 0 auto;
+  border-radius: 999px;
+  background: #34d399;
+  box-shadow: 0 0 0 4px rgba(52, 211, 153, 0.12), 0 0 18px #34d399;
+  animation: live-control-beacon 1.25s ease-in-out infinite;
+}
+
+.control-live-dot.is-paused {
+  background: #fbbf24;
+  box-shadow: 0 0 0 4px rgba(251, 191, 36, 0.12), 0 0 18px #fbbf24;
+  animation-play-state: paused;
+}
+
+.control-diagram-scroll {
+  overflow-x: auto;
+  padding: 0.4rem 0 0.8rem;
+  scrollbar-color: color-mix(in srgb, var(--controller-color) 55%, #334155) #020617;
+}
+
+.control-diagram-stage {
+  position: relative;
+  min-width: 1180px;
+  overflow: hidden;
+  border: 1px solid rgba(71, 85, 105, 0.7);
+  border-radius: 1rem;
+  padding: 1.4rem 1.25rem 1.1rem;
+  background: rgba(2, 6, 23, 0.72);
+  box-shadow: inset 0 0 40px rgba(0, 0, 0, 0.45);
+}
+
+.control-scan-line {
+  position: absolute;
+  inset: 0 auto 0 -25%;
+  width: 28%;
+  pointer-events: none;
+  background: linear-gradient(90deg, transparent, color-mix(in srgb, var(--controller-color) 9%, transparent), transparent);
+  animation: control-scan 6s linear infinite;
+}
+
+.control-main-loop {
+  position: relative;
+  z-index: 2;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.control-diagram-node {
+  width: 155px;
+  min-height: 104px;
+  display: flex;
+  flex: 0 0 auto;
+  flex-direction: column;
+  justify-content: center;
+  border: 1px solid color-mix(in srgb, var(--node-color) 54%, #334155);
+  border-radius: 0.9rem;
+  padding: 0.85rem;
+  background:
+    linear-gradient(145deg, color-mix(in srgb, var(--node-color) 10%, #0f172a), rgba(2, 6, 23, 0.96));
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.05),
+    0 0 22px color-mix(in srgb, var(--node-color) 10%, transparent);
+  transition: transform 180ms ease, border-color 180ms ease;
+}
+
+.control-diagram-node:hover {
+  transform: translateY(-3px);
+  border-color: var(--node-color);
+}
+
+.control-diagram-node.is-compact {
+  width: 125px;
+}
+
+.control-node-eyebrow {
+  margin-bottom: 0.45rem;
+  color: var(--node-color);
+  font: 700 0.58rem/1.2 "Cascadia Code", Consolas, monospace;
+  letter-spacing: 0.13em;
+}
+
+.control-diagram-node strong {
+  color: #f8fafc;
+  font-size: 0.8rem;
+}
+
+.control-node-value {
+  margin-top: 0.42rem;
+  color: #94a3b8;
+  font: 600 0.68rem/1.35 "Cascadia Code", Consolas, monospace;
+}
+
+.control-flow-link {
+  --flow-color: #38bdf8;
+  position: relative;
+  width: 52px;
+  height: 3px;
+  flex: 0 0 auto;
+  overflow: visible;
+  background: color-mix(in srgb, var(--flow-color) 38%, #1e293b);
+  box-shadow: 0 0 10px color-mix(in srgb, var(--flow-color) 18%, transparent);
+}
+
+.control-flow-link::after {
+  position: absolute;
+  top: 50%;
+  right: -1px;
+  width: 0;
+  height: 0;
+  content: "";
+  transform: translateY(-50%);
+  border-top: 5px solid transparent;
+  border-bottom: 5px solid transparent;
+  border-left: 8px solid var(--flow-color);
+}
+
+.control-flow-link.is-reverse::after {
+  right: auto;
+  left: -1px;
+  transform: translateY(-50%) rotate(180deg);
+}
+
+.control-flow-pulse {
+  position: absolute;
+  top: 50%;
+  left: 0;
+  width: 9px;
+  height: 9px;
+  border-radius: 999px;
+  background: #fff;
+  box-shadow: 0 0 8px 2px var(--flow-color);
+  transform: translateY(-50%);
+  animation: live-signal var(--flow-duration, 1.2s) linear infinite;
+}
+
+.control-flow-link.is-reverse .control-flow-pulse {
+  animation-name: live-signal-reverse;
+}
+
+.control-flow-link.is-paused .control-flow-pulse {
+  animation-play-state: paused;
+}
+
+.control-flow-label {
+  position: absolute;
+  left: 50%;
+  bottom: calc(100% + 0.35rem);
+  width: max-content;
+  max-width: 110px;
+  transform: translateX(-50%);
+  color: color-mix(in srgb, var(--flow-color) 72%, white);
+  font: 600 0.58rem/1.2 "Cascadia Code", Consolas, monospace;
+}
+
+.control-feedback-zone {
+  position: relative;
+  z-index: 1;
+  margin: 1rem 5.5rem 0;
+  padding-top: 1rem;
+  border-top: 1px solid color-mix(in srgb, var(--controller-color) 28%, #334155);
+}
+
+.control-feedback-return {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.control-feedback-return .control-flow-link {
+  width: 65%;
+}
+
+.control-return-corner {
+  width: 13%;
+  height: 22px;
+  border-top: 2px solid color-mix(in srgb, var(--controller-color) 45%, #334155);
+  border-right: 2px solid color-mix(in srgb, var(--controller-color) 45%, #334155);
+  border-radius: 0 0.65rem 0 0;
+}
+
+.control-return-corner.is-left {
+  border-right: 0;
+  border-left: 2px solid color-mix(in srgb, var(--controller-color) 45%, #334155);
+  border-radius: 0.65rem 0 0 0;
+}
+
+.control-feedback-cards {
+  display: flex;
+  justify-content: center;
+  gap: 0.55rem;
+  margin-top: 0.75rem;
+}
+
+.control-feedback-chip {
+  min-width: 130px;
+  display: grid;
+  gap: 0.2rem;
+  border: 1px solid rgba(71, 85, 105, 0.65);
+  border-radius: 0.7rem;
+  padding: 0.55rem 0.75rem;
+  background: rgba(15, 23, 42, 0.88);
+  text-align: center;
+}
+
+.control-feedback-chip span {
+  color: #64748b;
+  font-size: 0.6rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
+.control-feedback-chip strong {
+  color: #cbd5e1;
+  font: 600 0.69rem/1.2 "Cascadia Code", Consolas, monospace;
+}
+
+.control-architecture-footer {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.75rem 1.25rem;
+  margin-top: 0.35rem;
+  color: #64748b;
+  font: 600 0.66rem/1.4 "Cascadia Code", Consolas, monospace;
+}
+
+.control-architecture-footer span:first-child {
+  margin-inline-end: auto;
+}
+
+.control-architecture-footer i {
+  display: inline-block;
+  width: 0.5rem;
+  height: 0.5rem;
+  margin-inline-end: 0.35rem;
+  border-radius: 999px;
+  box-shadow: 0 0 10px currentColor;
+}
+
+.control-architecture-footer strong {
+  color: #e2e8f0;
+}
+
+@keyframes live-signal {
+  from { left: 0; }
+  to { left: calc(100% - 9px); }
+}
+
+@keyframes live-signal-reverse {
+  from { left: calc(100% - 9px); }
+  to { left: 0; }
+}
+
+@keyframes live-control-beacon {
+  0%, 100% { opacity: 0.55; transform: scale(0.85); }
+  50% { opacity: 1; transform: scale(1.08); }
+}
+
+@keyframes control-scan {
+  from { transform: translateX(0); }
+  to { transform: translateX(450%); }
+}
+
+@media (max-width: 1100px) {
+  .simulation-mode-panel {
+    grid-template-columns: 1fr;
+  }
+}
+
+@media (max-width: 860px) {
+  .control-architecture-header {
+    flex-direction: column;
+  }
+
+  .control-formula-card {
+    width: 100%;
+  }
+
+  .control-diagram-stage {
+    min-width: 1080px;
+  }
+
+  .flight-hud {
+    top: 45%;
+    transform: scale(0.86);
+  }
+
+  .flight-hud-left {
+    transform-origin: left center;
+  }
+
+  .flight-hud-right {
+    transform-origin: right center;
+  }
+}
+
 @media (prefers-reduced-motion: reduce) {
   *,
   *::before,
